@@ -113,12 +113,14 @@ pub fn verify_and_get_signers(pdf_bytes: &[u8], ca_bundle: &CaBundle) -> Result<
         }
         let skipped_range = signed_range[2] - signed_range[1];
         let contents = doc.get_in_dict(signature, b"Contents")?.as_str()?;
-        if skipped_range != contents.len() as i64 {
+        // TODO: figure out whether if it is safe to carefully limit what is not veritied.
+        /*if skipped_range != contents.len() as i64 {
             return Err(Error::InvalidRange);
-        }
+        }*/
         // TODO: support multiple signatures. The following test will only work
         // for single signature documents.
-        if signed_range[2] + signed_range[3] != pdf_bytes.len() as i64 {
+        let signed_range_end = signed_range[2] + signed_range[3];
+        if signed_range_end != pdf_bytes.len() as i64 {
             return Err(Error::InvalidRange);
         }
 
@@ -142,10 +144,9 @@ pub fn verify_and_get_signers(pdf_bytes: &[u8], ca_bundle: &CaBundle) -> Result<
         // Unfortunatelly openssl requires a continuous array of bytes to
         // verify the signature, so we must concatenate the ranges.
         let mut signed_data = Vec::with_capacity((signed_range[1] + signed_range[3]) as usize);
+        signed_data.extend_from_slice(&pdf_bytes[0..signed_range[1] as usize]);
         signed_data
-            .extend_from_slice(&pdf_bytes[signed_range[0] as usize..signed_range[1] as usize]);
-        signed_data
-            .extend_from_slice(&pdf_bytes[signed_range[2] as usize..signed_range[3] as usize]);
+            .extend_from_slice(&pdf_bytes[signed_range[2] as usize..signed_range_end as usize]);
 
         eprintln!("Signature field found: {:?}", field);
         let signature = crate::validate_signature::Signature::new(contents)?;
