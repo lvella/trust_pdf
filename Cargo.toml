@@ -4,4 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+array-init = "2.1"
 lopdf = "0.33"
+openssl = "0.10"
+thiserror = "1.0"

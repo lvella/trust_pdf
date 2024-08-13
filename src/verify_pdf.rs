@@ -1,6 +1,21 @@
-use std::collections::HashSet;
+use lopdf::{Dictionary, Document, Object};
+use thiserror::Error;
 
-use lopdf::{Dictionary, Document, Error, Object, Result};
+use crate::validate_signature::{CaBundle, SignerInfo};
+
+#[derive(Error, Debug)]
+pub enum Error {
+    #[error("PDF parsing error")]
+    ParsingError(#[from] lopdf::Error),
+    #[error("signature verification error")]
+    SignatureVerificationError(#[from] crate::validate_signature::Error),
+    #[error("file is not signed from the beginning")]
+    WrongRangeStart,
+    #[error("invalid signature range")]
+    InvalidRange,
+}
+
+type Result<T> = std::result::Result<T, Error>;
 
 trait GetInDict {
     fn get_in_dict<'a>(&'a self, dict: &'a Dictionary, key: &[u8]) -> Result<&'a Object>;
@@ -20,41 +35,128 @@ impl GetInDict for Document {
                 let obj = self.get_object(*id)?;
                 if let Object::Reference(_) = obj {
                     // ChatGPT says a reference to another reference is invalid
-                    return Err(Error::Type);
+                    return Err(Error::ParsingError(lopdf::Error::Type));
                 }
                 Ok(obj)
-            },
+            }
             _ => Ok(obj),
         }
     }
 }
 
-pub fn extract_valid_signatures(pdf_bytes: &[u8]) -> Result<()>
-{
+struct ExactArrayOrNone<T, const N: usize>(Option<[T; N]>);
+
+impl<T, const N: usize> FromIterator<T> for ExactArrayOrNone<T, N> {
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        let mut iter = iter.into_iter();
+        let result = array_init::from_iter(&mut iter);
+        let result = if iter.next().is_none() { result } else { None };
+        ExactArrayOrNone(result)
+    }
+}
+
+pub fn verify_and_get_signers(pdf_bytes: &[u8], ca_bundle: &CaBundle) -> Result<Vec<SignerInfo>> {
     let doc = Document::load_mem(pdf_bytes)?;
 
+    let mut result = Vec::new();
+
     // Access the AcroForm dictionary
-    if let Object::Dictionary(acro_form) = doc.catalog()?.get(b"AcroForm")? {
-        // Early skip if the form does not have any signatures
-        if let Object::Integer(sig_flags) = doc.get_in_dict(acro_form, b"SigFlags")? {
-            if sig_flags & 1 == 0 {
-                return Err(lopdf::Error::Invalid("No signatures found".to_string()));
-            }
-        }
+    let acro_form = doc.get_dict_in_dict(doc.catalog()?, b"AcroForm")?;
 
-        // Get the form fields array
-        for field in doc.get_in_dict(acro_form, b"Fields")?.as_array()?.iter().map(|f| doc.deref(f)) {
-            let field = field?.as_dict()?;
-
-            // Check if the field is a signature
-            if is_signature(field) {
-                println!("Field: {:#?}", field);
-                // TODO: verify the signature
-            }
-        }
+    // Early skip if the form does not have any signatures
+    let sig_flags = doc.get_in_dict(acro_form, b"SigFlags")?.as_i64()?;
+    if sig_flags & 1 == 0 {
+        return Ok(result);
     }
 
-    Ok(())
+    // Get the form fields array
+    for field in doc
+        .get_in_dict(acro_form, b"Fields")?
+        .as_array()?
+        .iter()
+        .map(|f| doc.deref(f))
+    {
+        let field = field?.as_dict()?;
+
+        // Check if the field is a signature
+        if !is_signature(field) {
+            continue;
+        }
+        let _rect = doc
+            .get_in_dict(field, b"Rect")?
+            .as_array()?
+            .iter()
+            .map(|r| doc.deref(r).and_then(|r| Ok(r.as_float()?)))
+            .collect::<Result<ExactArrayOrNone<f32, 4>>>()?
+            .0
+            .ok_or(lopdf::Error::Type)?;
+
+        // TODO: check if the signature box is inside the allowed area
+
+        let signature = doc.get_dict_in_dict(field, b"V")?;
+
+        let signed_range = doc
+            .get_in_dict(signature, b"ByteRange")?
+            .as_array()?
+            .iter()
+            .map(|r| doc.deref(r).and_then(|r| Ok(r.as_i64()?)))
+            .collect::<Result<ExactArrayOrNone<i64, 4>>>()?
+            .0
+            .ok_or(lopdf::Error::Type)?;
+
+        // For soundness, we must ensure the only range that is not signed is the signature contents itself.
+        if signed_range[0] != 0 {
+            return Err(Error::WrongRangeStart);
+        }
+        if signed_range[1] > signed_range[2] {
+            return Err(Error::InvalidRange);
+        }
+        let skipped_range = signed_range[2] - signed_range[1];
+        let contents = doc.get_in_dict(signature, b"Contents")?.as_str()?;
+        if skipped_range != contents.len() as i64 {
+            return Err(Error::InvalidRange);
+        }
+        // TODO: support multiple signatures. The following test will only work
+        // for single signature documents.
+        if signed_range[2] + signed_range[3] != pdf_bytes.len() as i64 {
+            return Err(Error::InvalidRange);
+        }
+
+        // TODO: ensure the original document is the prefix of the signed
+        // document (but this can probably be done in the caller function).
+
+        // TODO: ensure that each signature covers an incrementally larger range
+        // of the document, and the last signature covers the whole document.
+
+        // TODO: ensure that each signature covers its own dictionaries (Widget
+        // anc V).
+
+        // TODO: for soundness, check that no visual elements were
+        // incrementally added to the original document before it was
+        // signed. Otherwise the user could have added visual elements to
+        // the document changing its meaning, but fooled us into thinking
+        // what was signed was the original document. Of course, legally
+        // this could be seen as some kind of fraud, and we would have the
+        // signed proof the user did it.
+
+        // Unfortunatelly openssl requires a continuous array of bytes to
+        // verify the signature, so we must concatenate the ranges.
+        let mut signed_data = Vec::with_capacity((signed_range[1] + signed_range[3]) as usize);
+        signed_data
+            .extend_from_slice(&pdf_bytes[signed_range[0] as usize..signed_range[1] as usize]);
+        signed_data
+            .extend_from_slice(&pdf_bytes[signed_range[2] as usize..signed_range[3] as usize]);
+
+        eprintln!("Signature field found: {:?}", field);
+        let signature = crate::validate_signature::Signature::new(contents)?;
+
+        result.extend(signature.get_signers_info()?);
+
+        // Verify the signature
+        signature.verify(&signed_data, ca_bundle)?;
+    }
+
+    Ok(result)
 }
 
 fn is_signature(annot_dict: &Dictionary) -> bool {
