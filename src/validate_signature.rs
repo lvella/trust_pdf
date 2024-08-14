@@ -1,3 +1,4 @@
+use std::ops::Deref;
 use std::path::Path;
 
 use openssl::nid::Nid;
@@ -27,7 +28,7 @@ impl CaBundle {
         for entry in std::fs::read_dir(certs_dir).unwrap() {
             let entry = entry.unwrap();
             let path = entry.path();
-            let cert = X509::from_pem(&std::fs::read(path).unwrap()).unwrap();
+            let cert = X509::from_pem(&std::fs::read(&path).unwrap()).unwrap();
             builder.add_cert(cert).unwrap();
         }
 
@@ -81,6 +82,8 @@ impl Signature {
     }
 }
 
+/// Errors out if there is not exactly one entry with the given NID in the
+/// distinguished name.
 fn get_only_entry(name: &X509NameRef, nid: Nid) -> Result<&X509NameEntryRef, Error> {
     let mut entries = name.entries_by_nid(nid);
     match (entries.next(), entries.next()) {

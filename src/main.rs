@@ -8,6 +8,7 @@ fn main() {
     for file in [
         "sample/unsigned.pdf",
         "sample/signed-visible.pdf",
+        "sample/signed-visible-twice.pdf",
         "sample/signed-invisible.pdf",
     ] {
         println!("processing {}", file);
