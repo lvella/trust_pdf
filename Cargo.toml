@@ -5,6 +5,8 @@ edition = "2021"
 
 [dependencies]
 array-init = "2.1"
+lazy_static = "1.5"
 lopdf = "0.33"
 openssl = "0.10"
+regex = "1.10"
 thiserror = "1.0"

@@ -1,4 +1,3 @@
-use std::ops::Deref;
 use std::path::Path;
 
 use openssl::nid::Nid;
@@ -90,46 +89,4 @@ fn get_only_entry(name: &X509NameRef, nid: Nid) -> Result<&X509NameEntryRef, Err
         (Some(entry), None) => Ok(entry),
         _ => Err(Error::WrongDistinguished),
     }
-}
-
-fn print_certificate_info(certificate: &X509) {
-    // Extract and print basic information from the certificate
-    let subject_name = certificate.subject_name();
-    let issuer_name = certificate.issuer_name();
-
-    println!("Certificate:");
-    println!(
-        "  Subject: {}",
-        subject_name
-            .entries()
-            .next()
-            .unwrap()
-            .data()
-            .as_utf8()
-            .unwrap()
-    );
-    println!(
-        "  Issuer: {}",
-        issuer_name
-            .entries()
-            .next()
-            .unwrap()
-            .data()
-            .as_utf8()
-            .unwrap()
-    );
-
-    // Extract and print the certificate's serial number
-    let serial_number = certificate.serial_number();
-    println!(
-        "  Serial Number: {}",
-        serial_number.to_bn().unwrap().to_hex_str().unwrap()
-    );
-
-    // Extract and print the signature algorithm
-    let signature_algorithm = certificate.signature_algorithm();
-    println!(
-        "  Signature Algorithm: {:?}",
-        signature_algorithm.object().nid()
-    );
 }
