@@ -1,6 +1,6 @@
 use std::ops::Range;
 
-use lopdf::{Dictionary, Document, Object};
+use lopdf::{xref::XrefEntry, Dictionary, Document, Object};
 use regex::bytes::Regex;
 use thiserror::Error;
 
@@ -9,7 +9,7 @@ use crate::validate_signature::{CaBundle, SignerInfo};
 #[derive(Error, Debug)]
 pub enum Error {
     #[error("PDF parsing error")]
-    ParsingError(#[from] lopdf::Error),
+    Parsing(#[from] lopdf::Error),
     #[error("reference document does not end like a PDF file")]
     InvalidReferenceDocument,
     #[error("end of the reference increment is bigger than the signed document")]
@@ -17,7 +17,9 @@ pub enum Error {
     #[error("can not guarantee the contents of the signed document match the original")]
     PossibleContentChange,
     #[error("signature verification error")]
-    SignatureVerificationError(#[from] crate::validate_signature::Error),
+    SignatureVerification(#[from] crate::validate_signature::Error),
+    #[error("invalid signature object")]
+    InvalidSignatureObject,
     #[error("file is not signed from the beginning")]
     WrongRangeStart,
     #[error("signature range does not end at the end of a PDF file")]
@@ -28,37 +30,11 @@ pub enum Error {
     InvalidCoverage,
     #[error("last signature does not cover the whole document")]
     IncompleteCoverage,
+    #[error("we encountered an internal consistency error that is a bug on the validator itself")]
+    InternalConsistency,
 }
 
 type Result<T> = std::result::Result<T, Error>;
-
-trait GetInDict {
-    fn get_in_dict<'a>(&'a self, dict: &'a Dictionary, key: &[u8]) -> Result<&'a Object>;
-    fn deref<'a>(&'a self, obj: &'a Object) -> Result<&'a Object>;
-}
-
-impl GetInDict for Document {
-    fn get_in_dict<'a>(&'a self, dict: &'a Dictionary, key: &[u8]) -> Result<&'a Object> {
-        let obj = dict.get(key)?;
-
-        self.deref(obj)
-    }
-
-    fn deref<'a>(&'a self, obj: &'a Object) -> Result<&'a Object> {
-        match obj {
-            Object::Reference(id) => {
-                let obj = self.get_object(*id)?;
-                if let Object::Reference(_) = obj {
-                    // ChatGPT says a reference to another reference is invalid
-                    // in PDF specification.
-                    return Err(Error::ParsingError(lopdf::Error::Type));
-                }
-                Ok(obj)
-            }
-            _ => Ok(obj),
-        }
-    }
-}
 
 struct ExactArrayOrNone<T, const N: usize>(Option<[T; N]>);
 
@@ -107,11 +83,11 @@ pub fn verify_from_reference(
     let end_of_reference_pdf = reference.len();
     drop(reference_pdf_bytes);
 
-    verify(&signed, end_of_reference_pdf, ca_bundle)
+    verify(signed, end_of_reference_pdf, ca_bundle)
 }
 
 /// Verifies the signatures in a PDF document, ensuring that the contents of the
-/// document matches a previous version of the same document.
+/// document matches a previous increment of the same document.
 pub fn verify(
     pdf_bytes: &[u8],
     end_of_reference_pdf: usize,
@@ -136,117 +112,47 @@ pub fn verify(
     };
 
     // Early skip if the form does not have any signatures
-    let sig_flags = doc.get_in_dict(acro_form, b"SigFlags")?.as_i64()?;
+    let sig_flags = acro_form.get_deref(b"SigFlags", &doc)?.as_i64()?;
     if sig_flags & 1 == 0 {
         return Ok(result);
     }
 
-    struct Signature<'a> {
-        coverage_end: usize,
-        skipped_range: Range<usize>,
-        rect: [f32; 4],
-        pkcs7_signature: &'a [u8],
-    }
+    let mut signatures = get_signature_objects(pdf_bytes, &doc, acro_form)?;
 
-    let mut signatures = Vec::new();
+    // Sort the signatures by decreasing coverage of the document.
+    signatures.sort_by_key(|s| -s.coverage_end);
 
-    // Get the form fields array
-    for field in doc
-        .get_in_dict(acro_form, b"Fields")?
-        .as_array()?
-        .iter()
-        .map(|f| doc.deref(f))
-    {
-        let field = field?.as_dict()?;
-
-        // Check if the field is a signature
-        if !is_signature(field) {
-            continue;
-        }
-
-        let signature = doc.get_dict_in_dict(field, b"V")?;
-
-        let signed_range = doc
-            .get_in_dict(signature, b"ByteRange")?
-            .as_array()?
-            .iter()
-            .map(|r| doc.deref(r).and_then(|r| Ok(r.as_i64()?)))
-            .collect::<Result<ExactArrayOrNone<i64, 4>>>()?
-            .0
-            .ok_or(lopdf::Error::Type)?;
-
-        // For soundness, we must ensure the signature covers the file since the
-        // beginning.
-        if signed_range[0] != 0 {
-            return Err(Error::WrongRangeStart);
-        }
-
-        // Sanity check that the range is well formed and inside the document.
-        for &range in &signed_range[1..] {
-            if range < 0 {
-                return Err(Error::InvalidRange);
-            }
-        }
-        let signed_range_end = signed_range[2] + signed_range[3];
-        if signed_range[1] > signed_range[2] || signed_range_end > pdf_bytes.len() as i64 {
-            return Err(Error::InvalidRange);
-        }
-
-        // The /Contents field must match the bytes skipped in the signed range, which must be hex encoded.
-        let skipped_bytes =
-            decode_pdf_hex_string(&pdf_bytes[signed_range[1] as usize..signed_range[2] as usize])
-                .ok_or(Error::InvalidCoverage)?;
-        let pkcs7_signature = doc.get_in_dict(signature, b"Contents")?.as_str()?;
-        if pkcs7_signature != skipped_bytes {
-            return Err(Error::InvalidCoverage);
-        }
-
-        // Tests if the signature range ends with the PDF end marker (%%EOF).
-        if !pdf_ends_with_eof(&pdf_bytes[..signed_range_end as usize]) {
-            return Err(Error::WrongRangeEnd);
-        }
-
-        let rect = doc
-            .get_in_dict(field, b"Rect")?
-            .as_array()?
-            .iter()
-            .map(|r| doc.deref(r).and_then(|r| Ok(r.as_float()?)))
-            .collect::<Result<ExactArrayOrNone<f32, 4>>>()?
-            .0
-            .ok_or(lopdf::Error::Type)?;
-
-        // Store the signature for later verification.
-        signatures.push(Signature {
-            coverage_end: signed_range_end as usize,
-            skipped_range: signed_range[1] as usize..signed_range[2] as usize,
-            rect,
-            pkcs7_signature,
-        });
-    }
-
-    // Sort the signatures by increasing coverage of the document.
-    signatures.sort_by_key(|s| s.coverage_end);
-
-    // The last signature must cover the whole document.
-    match signatures.last() {
+    // The biggest signature must cover the whole document.
+    match signatures.first() {
         Some(last) => {
-            if last.coverage_end != pdf_bytes.len() {
-                return Err(Error::InvalidCoverage);
+            if last.coverage_end as usize != pdf_bytes.len() {
+                return Err(Error::IncompleteCoverage);
             }
         }
-        None => return Ok(result),
+        None => {
+            if end_of_reference_pdf == pdf_bytes.len() {
+                // If there are no signatures, the document must be the same as the reference.
+                return Ok(result);
+            } else {
+                // There document is bigger than the reference, but there are no signatures.
+                return Err(Error::PossibleContentChange);
+            }
+        }
     }
 
-    for signature in signatures {
-        // TODO: ensure the original document is the prefix of the signed
-        // document (but this can probably be done in the caller function).
+    // Signatures validating ranges inside the reference document won't be
+    // subject to scrutiny on how they were added, so we filter them out for the
+    // next step.
+    let added_signatures = &signatures
+        [..signatures.partition_point(|s| s.coverage_end as usize > end_of_reference_pdf)];
 
-        // TODO: ensure that each signature covers an incrementally larger range
-        // of the document, and the last signature covers the whole document.
+    // An iterator in decreasing order over the incremental updates we are comparing against.
+    let incremental_updates = added_signatures[1..]
+        .iter()
+        .map(|s| s.coverage_end as usize)
+        .chain([end_of_reference_pdf]);
 
-        // TODO: ensure that each signature covers its own dictionaries (Widget
-        // anc V).
-
+    for (sig, previous_doc) in added_signatures.iter().zip(incremental_updates) {
         // TODO: for soundness, check that no visual elements were
         // incrementally added to the original document before it was
         // signed. Otherwise the user could have added visual elements to
@@ -254,25 +160,148 @@ pub fn verify(
         // what was signed was the original document. Of course, legally
         // this could be seen as some kind of fraud, and we would have the
         // signed proof the user did it.
+    }
 
-        // Unfortunatelly openssl requires a continuous array of bytes to
-        // verify the signature, so we must concatenate the ranges.
+    // Finally, we verify the signatures.
+    for sig in signatures {
+        // Openssl requires a continuous array of bytes to verify the signature,
+        // so we must concatenate the ranges.
+        let data_size = sig.coverage_end as usize - sig.skipped_range.len();
+        let mut signed_data = Vec::with_capacity(data_size);
+        signed_data.extend_from_slice(&pdf_bytes[0..sig.skipped_range.start]);
+        signed_data.extend_from_slice(&pdf_bytes[sig.skipped_range.end..sig.coverage_end as usize]);
+        assert!(signed_data.len() == data_size);
 
-        /*let mut signed_data = Vec::with_capacity((signed_range[1] + signed_range[3]) as usize);
-        signed_data.extend_from_slice(&pdf_bytes[0..signed_range[1] as usize]);
-        signed_data
-            .extend_from_slice(&pdf_bytes[signed_range[2] as usize..signed_range_end as usize]);
-
-        eprintln!("Signature field found: {:?}", field);
-        let signature = crate::validate_signature::Signature::new(pkcs7_signature)?;
+        let signature = crate::validate_signature::Signature::new(sig.pkcs7_der)?;
 
         result.extend(signature.get_signers_info()?);
 
         // Verify the signature
-        signature.verify(&signed_data, ca_bundle)?;*/
+        signature.verify(&signed_data, ca_bundle)?;
     }
 
     Ok(result)
+}
+
+struct Signature<'a> {
+    coverage_end: i64,
+    skipped_range: Range<usize>,
+    rect: [f32; 4],
+    pkcs7_der: &'a [u8],
+}
+
+fn get_signature_objects<'a>(
+    pdf_bytes: &[u8],
+    doc: &'a Document,
+    acro_form: &'a Dictionary,
+) -> Result<Vec<Signature<'a>>> {
+    let mut signatures = Vec::new();
+
+    for field in acro_form
+        .get_deref(b"Fields", doc)?
+        .as_array()?
+        .iter()
+        .map(|f| doc.dereference(f))
+    {
+        let field = field?.1.as_dict()?;
+
+        // Check if the field is a signature
+        if !is_signature(field) {
+            continue;
+        }
+
+        signatures.push(process_signature(pdf_bytes, doc, field)?);
+    }
+
+    Ok(signatures)
+}
+
+fn process_signature<'a>(
+    pdf_bytes: &[u8],
+    doc: &'a Document,
+    field: &'a Dictionary,
+) -> Result<Signature<'a>> {
+    let (Some(signature_obj_id), Object::Dictionary(signature)) =
+        doc.dereference(field.get(b"V")?)?
+    else {
+        // Signature object must be an indirect dictionary.
+        return Err(Error::InvalidSignatureObject);
+    };
+
+    let signed_range = signature
+        .get_deref(b"ByteRange", doc)?
+        .as_array()?
+        .iter()
+        .map(|r| doc.dereference(r).and_then(|(_, r)| r.as_i64()))
+        .collect::<lopdf::Result<ExactArrayOrNone<i64, 4>>>()?
+        .0
+        .ok_or(lopdf::Error::Type)?;
+
+    // For soundness, we must ensure the signature covers the file since the
+    // beginning.
+    if signed_range[0] != 0 {
+        return Err(Error::WrongRangeStart);
+    }
+
+    // The signature object must be inside the signed range.
+    if let XrefEntry::Normal { offset, generation } =
+        doc.reference_table.get(signature_obj_id.0).ok_or(
+            // This entry must exist, as it was dereferenced above. But to be
+            // resilient, we won't panic.
+            Error::InternalConsistency,
+        )?
+    {
+        if *generation != signature_obj_id.1 {
+            // The generation is known, so it must match the entry in the xref table.
+            return Err(Error::InternalConsistency);
+        }
+        if *offset as i64 >= signed_range[1] {
+            return Err(Error::InvalidCoverage);
+        }
+    } else {
+        return Err(Error::InvalidSignatureObject);
+    };
+
+    // Sanity check that the range is well formed and inside the document.
+    for &range in &signed_range[1..] {
+        if range < 0 {
+            return Err(Error::InvalidRange);
+        }
+    }
+    let signed_range_end = signed_range[2] + signed_range[3];
+    if signed_range[1] > signed_range[2] || signed_range_end > pdf_bytes.len() as i64 {
+        return Err(Error::InvalidRange);
+    }
+
+    // The /Contents field must match the bytes skipped in the signed range, which must be hex encoded.
+    let skipped_bytes =
+        decode_pdf_hex_string(&pdf_bytes[signed_range[1] as usize..signed_range[2] as usize])
+            .ok_or(Error::InvalidCoverage)?;
+    let pkcs7_signature = signature.get_deref(b"Contents", doc)?.as_str()?;
+    if pkcs7_signature != skipped_bytes {
+        return Err(Error::InvalidCoverage);
+    }
+
+    // Tests if the signature range ends with the PDF end marker (%%EOF).
+    if !pdf_ends_with_eof(&pdf_bytes[..signed_range_end as usize]) {
+        return Err(Error::WrongRangeEnd);
+    }
+
+    let rect = field
+        .get_deref(b"Rect", doc)?
+        .as_array()?
+        .iter()
+        .map(|r| doc.dereference(r).and_then(|(_, r)| r.as_float()))
+        .collect::<lopdf::Result<ExactArrayOrNone<f32, 4>>>()?
+        .0
+        .ok_or(lopdf::Error::Type)?;
+
+    Ok(Signature {
+        coverage_end: signed_range_end,
+        skipped_range: signed_range[1] as usize..signed_range[2] as usize,
+        rect,
+        pkcs7_der: pkcs7_signature,
+    })
 }
 
 fn is_signature(annot_dict: &Dictionary) -> bool {
