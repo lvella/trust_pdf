@@ -1,4 +1,4 @@
-use std::{cell::RefCell, collections::HashSet, ops::Range, rc::Rc};
+use std::{cell::RefCell, collections::HashSet, ops::Range};
 
 use lopdf::{xref::XrefEntry, Dictionary, Document, Object, ObjectId};
 use regex::bytes::Regex;
