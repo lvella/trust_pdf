@@ -4,7 +4,7 @@ use lopdf::{xref::XrefEntry, Dictionary, Document, Object, ObjectId};
 use regex::bytes::Regex;
 use thiserror::Error;
 
-use crate::validate_signature::{CaBundle, SignerInfo};
+use crate::signature_validation::{CaBundle, SignerInfo};
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -17,7 +17,7 @@ pub enum Error {
     #[error("can not guarantee the contents of the signed document match the original")]
     PossibleContentChange,
     #[error("signature verification error")]
-    SignatureVerification(#[from] crate::validate_signature::Error),
+    SignatureVerification(#[from] crate::signature_validation::Error),
     #[error("invalid signature object")]
     InvalidSignatureObject,
     #[error("file is not signed from the beginning")]
@@ -182,7 +182,7 @@ pub fn verify(
         signed_data.extend_from_slice(&pdf_bytes[sig.skipped_range.end..sig.coverage_end as usize]);
         assert!(signed_data.len() == data_size);
 
-        let signature = crate::validate_signature::Signature::new(sig.pkcs7_der)?;
+        let signature = crate::signature_validation::Signature::new(sig.pkcs7_der)?;
 
         result.extend(signature.get_signers_info()?);
 
