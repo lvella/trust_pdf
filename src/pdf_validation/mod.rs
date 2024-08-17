@@ -32,7 +32,9 @@ pub enum Error {
     InvalidCoverage,
     #[error("last signature does not cover the whole document")]
     IncompleteCoverage,
-    #[error("we encountered an internal consistency error that is a bug on the validator itself")]
+    #[error("can not ensure that the incremental update didn't change the document")]
+    PossibleIncrementalChange(#[from] increment_validation::Error),
+    #[error("we encountered an internal consistency error, this is a bug that should be reported")]
     InternalConsistency,
 }
 
