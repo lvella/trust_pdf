@@ -57,17 +57,19 @@ impl<'a> DocTracker<'a> {
     }
 
     fn deref(&self, mut obj: &'a Object) -> Result<&Object> {
-        let mut seen = HashMap::new();
-
-        while let Object::Reference(id) = obj {
-            if !seen.insert(id.0, id.1).is_none() {
-                return Err(Error::Parsing(lopdf::Error::ReferenceLimit));
+        // It is reasonable to only track the first reference in a chain of
+        // references, because that is the only one that needs to change.
+        match obj {
+            Object::Reference(id) => {
+                if let Some(gen) = self.traversed.borrow_mut().insert(id.0, id.1) {
+                    if gen != id.1 {
+                        return Err(Error::Parsing(lopdf::Error::ObjectIdMismatch));
+                    }
+                }
+                Ok(self.doc.get_object(*id)?)
             }
-            obj = self.doc.get_object(*id)?;
+            _ => Ok(obj),
         }
-
-        self.traversed_extend(seen)?;
-        Ok(obj)
     }
 
     fn deref_dict(&self, obj: &'a Object) -> Result<DictTracker> {
@@ -75,60 +77,6 @@ impl<'a> DocTracker<'a> {
             tracker: self,
             dict: self.deref(obj)?.as_dict()?,
         })
-    }
-
-    fn deep_track(&self, obj: &'a Object) -> Result<()> {
-        let mut seen = HashMap::new();
-        let mut stack = vec![obj];
-
-        while let Some(obj) = stack.pop() {
-            match obj {
-                Object::Reference(id) => match seen.insert(id.0, id.1) {
-                    None => {
-                        let obj = self.doc.get_object(*id)?;
-                        stack.push(obj);
-                    }
-                    Some(generation) => {
-                        if generation != id.1 {
-                            return Err(Error::Parsing(lopdf::Error::ObjectIdMismatch));
-                        }
-                    }
-                },
-                Object::Dictionary(dict) => {
-                    for (_, obj) in dict.iter() {
-                        stack.push(obj);
-                    }
-                }
-                Object::Array(arr) => {
-                    for obj in arr.iter() {
-                        stack.push(obj);
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        self.traversed_extend(seen)?;
-
-        Ok(())
-    }
-
-    fn traversed_extend(&self, new: HashMap<u32, u16>) -> Result<()> {
-        let mut traversed = self.traversed.borrow_mut();
-        for (id, generation) in new {
-            match traversed.entry(id) {
-                Entry::Vacant(entry) => {
-                    entry.insert(generation);
-                }
-                Entry::Occupied(entry) => {
-                    if *entry.get() != generation {
-                        return Err(Error::Parsing(lopdf::Error::ObjectIdMismatch));
-                    }
-                }
-            }
-        }
-
-        Ok(())
     }
 
     fn verify_all_changes_are_allowed(self, other: &Document) -> Result<()> {
@@ -167,11 +115,16 @@ impl<'a> DocTracker<'a> {
                     if container != other_container || index != other_index {
                         return Err(Error::XrefMismatch);
                     }
-                    // TODO: ensure this is sound
                 }
                 (XrefEntry::Free, XrefEntry::Free) => {}
                 (XrefEntry::UnusableFree, XrefEntry::UnusableFree) => {}
-                _ => return Err(Error::XrefMismatch),
+                _ => {
+                    assert!(
+                        std::mem::discriminant(entry) != std::mem::discriminant(other_entry),
+                        "Bug: unhandled XrefEntry variant in match"
+                    );
+                    return Err(Error::XrefMismatch);
+                }
             }
         }
 
@@ -192,23 +145,19 @@ pub fn verify_increment(
     // this could be seen as some kind of fraud, and we would have the
     // signed proof the user did it.
 
-    let curr_doc_tracker = DocTracker::new(curr_doc);
-    let previous_doc_tracker = DocTracker::new(previous_doc);
+    let prev_doc_tracker = DocTracker::new(previous_doc);
 
-    verify_catalogs(&curr_doc_tracker, &previous_doc_tracker)?;
+    verify_catalogs(&curr_doc, &prev_doc_tracker)?;
 
-    // For each document, all the indirect objects in the tracked list are allowed to be
-    // different from the other list.
-    curr_doc_tracker.verify_all_changes_are_allowed(&previous_doc)?;
-    previous_doc_tracker.verify_all_changes_are_allowed(&curr_doc)?;
+    // All the indirect objects in the tracked list are allowed to be
+    // different from the corresponding object in the current document.
+    // All others must match.
+    prev_doc_tracker.verify_all_changes_are_allowed(&curr_doc)?;
 
     Ok(())
 }
 
-fn verify_catalogs<'a, 'b>(
-    curr_doc: &'a DocTracker<'a>,
-    previous_doc: &'b DocTracker<'b>,
-) -> Result<()> {
+fn verify_catalogs<'a, 'b>(curr_doc: &'a Document, previous_doc: &'b DocTracker<'b>) -> Result<()> {
     let curr_catalog = curr_doc.catalog()?;
     let prev_catalog = previous_doc.catalog()?;
 
