@@ -1,3 +1,5 @@
+use crate::pdf_validation::ExactArrayOrNone;
+
 use super::Signature;
 use lopdf::{xref::XrefEntry, Dictionary, Document, Object, ObjectId};
 use std::{
@@ -21,6 +23,8 @@ pub enum Error {
     MultiplePagesChanged,
     #[error("mismatch between /Page dictionaries")]
     PageMismatch,
+    #[error("invalid annotation")]
+    InvalidAnnotation,
     #[error("mismatch between xref tables")]
     XrefMismatch,
 }
@@ -146,19 +150,17 @@ pub struct Annotation {
     pub rect: [f32; 4],
 }
 
+/// For soundness, check that no visual elements were incrementally added to the
+/// original document before it was signed. Otherwise the user could have added
+/// visual elements to the document changing its meaning, but fooled us into
+/// thinking what was signed was the original document. Of course, legally this
+/// could be seen as some kind of fraud, and we would have the signed proof the
+/// user did it.
 pub fn verify_increment(
     curr_sig: &Signature,
     curr_doc: &Document,
     previous_doc: &Document,
 ) -> Result<Option<Annotation>> {
-    // TODO: for soundness, check that no visual elements were
-    // incrementally added to the original document before it was
-    // signed. Otherwise the user could have added visual elements to
-    // the document changing its meaning, but fooled us into thinking
-    // what was signed was the original document. Of course, legally
-    // this could be seen as some kind of fraud, and we would have the
-    // signed proof the user did it.
-
     let prev_doc_tracker = DocTracker::new(previous_doc);
 
     let anotation = verify_catalogs(curr_sig, curr_doc, &prev_doc_tracker)?;
@@ -290,15 +292,9 @@ fn verify_acro_forms(
 
 /// Verifies the form field which contains the signature.
 fn verify_form(doc: &Document, form_id: ObjectId, reference_sig: &Signature) -> Result<()> {
-    todo!()
-}
-
-/// Verifies the signature itself.
-fn verify_signature(
-    doc: &Document,
-    sig_dict: &Dictionary,
-    reference_sig: &Signature,
-) -> Result<()> {
+    // TODO: check /FT is /Sig
+    // TODO: check /V is the reference signature id
+    // TODO: check the reference signature id has the expected offset in the xref table (this could be done much early, in the toplevel function).
     todo!()
 }
 
@@ -454,6 +450,39 @@ fn verify_page(
 /// mess with the original appearance of the page, but we can at least extract
 /// the rectangle where the annotation is contained, and return it.
 fn verify_annotation(doc: &Document, page_id: ObjectId, annot_id: ObjectId) -> Result<[f32; 4]> {
-    let annot = doc.get_dictionary(annot_id)?;
-    todo!()
+    let dict = doc.get_dictionary(annot_id)?;
+
+    // /Type is optional, but if present, it must be /Annot.
+    match dict.get_deref(b"Type", doc) {
+        Ok(obj) => {
+            if obj.as_name()? != b"Annot".as_slice() {
+                return Err(Error::InvalidAnnotation);
+            }
+        }
+        Err(lopdf::Error::DictKey) => (),
+        Err(e) => return Err(Error::Parsing(e)),
+    };
+
+    // /P is optional, but if present, it must point to the page where the
+    // annotation is.
+    if let Ok(p) = dict.get_deref(b"P", doc) {
+        if p.as_reference()? != page_id {
+            return Err(Error::InvalidAnnotation);
+        }
+    }
+
+    // /Subtype /Widget is mandatory.
+    if dict.get_deref(b"Subtype", doc)?.as_name()? != b"Widget".as_slice() {
+        return Err(Error::InvalidAnnotation);
+    }
+
+    // /Rect is also mandatory.
+    Ok(dict
+        .get_deref(b"Rect", doc)?
+        .as_array()?
+        .iter()
+        .map(|r| doc.dereference(r).and_then(|(_, r)| r.as_float()))
+        .collect::<lopdf::Result<ExactArrayOrNone<f32, 4>>>()?
+        .0
+        .ok_or(lopdf::Error::Type)?)
 }

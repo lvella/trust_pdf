@@ -2,7 +2,8 @@ mod increment_validation;
 
 use std::ops::Range;
 
-use lopdf::{xref::XrefEntry, Dictionary, Document, Object};
+use increment_validation::Annotation;
+use lopdf::{xref::XrefEntry, Dictionary, Document, Object, ObjectId};
 use regex::bytes::Regex;
 use thiserror::Error;
 
@@ -91,9 +92,10 @@ pub fn verify_from_reference(
 }
 
 struct Signature<'a> {
+    obj_id: ObjectId,
+    offset: u32,
     coverage_end: i64,
     skipped_range: Range<usize>,
-    rect: [f32; 4],
     pkcs7_der: &'a [u8],
 }
 
@@ -121,12 +123,6 @@ pub fn verify(
         Err(lopdf::Error::DictKey) => return Ok(result),
         Err(e) => return Err(e.into()),
     };
-
-    // Early skip if the form does not have any signatures
-    let sig_flags = acro_form.get_deref(b"SigFlags", &doc)?.as_i64()?;
-    if sig_flags & 1 == 0 {
-        return Ok(result);
-    }
 
     let mut signatures = get_signature_objects(pdf_bytes, &doc, acro_form)?;
 
@@ -168,8 +164,13 @@ pub fn verify(
         let mut tmp_storage;
         let mut curr_doc = &doc;
         for (sig, previous_doc) in added_signatures.iter().zip(incremental_updates) {
+            // Signature offset must be after the previous document.
+            if (sig.offset as usize) < previous_doc {
+                return Err(Error::InvalidSignatureObject);
+            }
+
             let previous_doc = Box::new(Document::load_mem(&pdf_bytes[..previous_doc])?);
-            increment_validation::verify_increment(sig, curr_doc, &previous_doc)?;
+            let annotation = increment_validation::verify_increment(sig, curr_doc, &previous_doc)?;
 
             tmp_storage = previous_doc;
             curr_doc = &tmp_storage;
@@ -177,6 +178,7 @@ pub fn verify(
     }
 
     // Finally, we verify the signatures.
+    // TODO: add a switch to disable verifying signatures in the reference document.
     for sig in signatures {
         // Openssl requires a continuous array of bytes to verify the signature,
         // so we must concatenate the ranges.
@@ -217,7 +219,7 @@ fn get_signature_objects<'a>(
             continue;
         }
 
-        signatures.push(process_signature(pdf_bytes, doc, field)?);
+        signatures.push(process_signature(pdf_bytes, doc, field.get(b"V")?)?);
     }
 
     Ok(signatures)
@@ -226,11 +228,9 @@ fn get_signature_objects<'a>(
 fn process_signature<'a>(
     pdf_bytes: &[u8],
     doc: &'a Document,
-    field: &'a Dictionary,
+    sig_reference: &'a Object,
 ) -> Result<Signature<'a>> {
-    let (Some(signature_obj_id), Object::Dictionary(signature)) =
-        doc.dereference(field.get(b"V")?)?
-    else {
+    let (Some(obj_id), Object::Dictionary(signature)) = doc.dereference(sig_reference)? else {
         // Signature object must be an indirect dictionary.
         return Err(Error::InvalidSignatureObject);
     };
@@ -251,20 +251,20 @@ fn process_signature<'a>(
     }
 
     // The signature object must be inside the signed range.
-    if let XrefEntry::Normal { offset, generation } =
-        doc.reference_table.get(signature_obj_id.0).ok_or(
+    let offset = if let XrefEntry::Normal { offset, generation } =
+        doc.reference_table.get(obj_id.0).ok_or(
             // This entry must exist, as it was dereferenced above. But to be
             // resilient, we won't panic.
             Error::InternalConsistency,
-        )?
-    {
-        if *generation != signature_obj_id.1 {
+        )? {
+        if *generation != obj_id.1 {
             // The generation is known, so it must match the entry in the xref table.
             return Err(Error::InternalConsistency);
         }
         if *offset as i64 >= signed_range[1] {
             return Err(Error::InvalidCoverage);
         }
+        *offset
     } else {
         return Err(Error::InvalidSignatureObject);
     };
@@ -294,33 +294,20 @@ fn process_signature<'a>(
         return Err(Error::WrongRangeEnd);
     }
 
-    let rect = field
-        .get_deref(b"Rect", doc)?
-        .as_array()?
-        .iter()
-        .map(|r| doc.dereference(r).and_then(|(_, r)| r.as_float()))
-        .collect::<lopdf::Result<ExactArrayOrNone<f32, 4>>>()?
-        .0
-        .ok_or(lopdf::Error::Type)?;
-
     Ok(Signature {
+        obj_id,
+        offset,
         coverage_end: signed_range_end,
         skipped_range: signed_range[1] as usize..signed_range[2] as usize,
-        rect,
         pkcs7_der: pkcs7_signature,
     })
 }
 
 fn is_signature(annot_dict: &Dictionary) -> bool {
-    // Check if /Subtype is /Widget
-    if let Ok(Object::Name(subtype)) = annot_dict.get(b"Subtype") {
-        if subtype == b"Widget" {
-            // Check for /FT (Field Type) being /Sig
-            if let Ok(Object::Name(ft)) = annot_dict.get(b"FT") {
-                if ft == b"Sig" {
-                    return true;
-                }
-            }
+    // Check for /FT (Field Type) being /Sig
+    if let Ok(Object::Name(ft)) = annot_dict.get(b"FT") {
+        if ft == b"Sig" {
+            return true;
         }
     }
     false
@@ -336,13 +323,9 @@ fn decode_pdf_hex_string(hex_input: &[u8]) -> Option<Vec<u8>> {
     let hex_input = &hex_input[1..hex_input.len() - 1];
 
     let mut bytes = Vec::new();
-    let mut hex_iter = hex_input.iter().filter_map(|&b| {
+    let mut hex_iter = hex_input.iter().map(|&b| {
         let c = b as char;
-        if c.is_whitespace() {
-            None
-        } else {
-            Some(c.to_digit(16))
-        }
+        c.to_digit(16)
     });
 
     while let Some(first) = hex_iter.next() {
