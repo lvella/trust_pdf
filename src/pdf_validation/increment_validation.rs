@@ -1,6 +1,10 @@
 use super::Signature;
 use lopdf::{xref::XrefEntry, Dictionary, Document, Object, ObjectId};
-use std::{cell::RefCell, collections::HashMap};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    vec::IntoIter,
+};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -13,8 +17,6 @@ pub enum Error {
     AcroFormMismatch,
     #[error("array has more than one extra reference")]
     NotSingleArrayIncrement,
-    #[error("two different signature annotations found in the increment")]
-    TwoDifferentSignatureInIncrement,
     #[error("multiple pages changed in the increment")]
     MultiplePagesChanged,
     #[error("mismatch between /Page dictionaries")]
@@ -28,17 +30,6 @@ pub type Result<T> = std::result::Result<T, Error>;
 struct DocTracker<'a> {
     traversed: RefCell<HashMap<u32, u16>>,
     doc: &'a Document,
-}
-
-struct DictTracker<'a> {
-    tracker: &'a DocTracker<'a>,
-    dict: &'a Dictionary,
-}
-
-impl<'a> DictTracker<'a> {
-    fn get_dict_deref(&self, key: &[u8]) -> Result<DictTracker<'a>> {
-        self.tracker.deref_dict(self.dict.get(key)?)
-    }
 }
 
 impl<'a> DocTracker<'a> {
@@ -57,18 +48,22 @@ impl<'a> DocTracker<'a> {
         .get_dict_deref(b"Root")
     }
 
+    fn get(&self, id: ObjectId) -> Result<&Object> {
+        if let Some(gen) = self.traversed.borrow_mut().insert(id.0, id.1) {
+            if gen != id.1 {
+                return Err(Error::Parsing(lopdf::Error::ObjectIdMismatch));
+            }
+        }
+        Ok(self.doc.get_object(id)?)
+    }
+
     fn deref(&self, obj: &'a Object) -> Result<&Object> {
         // It is reasonable to only track the first reference in a chain of
-        // references, because that is the only one that needs to change.
+        // references, because that is the only one that needs to change. I.e.,
+        // we don't allow an increment update to introduce a silly chain of
+        // references.
         match obj {
-            Object::Reference(id) => {
-                if let Some(gen) = self.traversed.borrow_mut().insert(id.0, id.1) {
-                    if gen != id.1 {
-                        return Err(Error::Parsing(lopdf::Error::ObjectIdMismatch));
-                    }
-                }
-                Ok(self.doc.get_object(*id)?)
-            }
+            Object::Reference(id) => self.get(*id),
             _ => Ok(obj),
         }
     }
@@ -93,39 +88,8 @@ impl<'a> DocTracker<'a> {
                 return Err(Error::XrefMismatch);
             };
 
-            // Unfortunatelly, XrefEntry does not implement PartialEq, so we have to compare manually.
-            match (entry, other_entry) {
-                (
-                    XrefEntry::Normal { offset, generation },
-                    XrefEntry::Normal {
-                        offset: other_offset,
-                        generation: other_generation,
-                    },
-                ) => {
-                    if offset != other_offset || generation != other_generation {
-                        return Err(Error::XrefMismatch);
-                    }
-                }
-                (
-                    XrefEntry::Compressed { container, index },
-                    XrefEntry::Compressed {
-                        container: other_container,
-                        index: other_index,
-                    },
-                ) => {
-                    if container != other_container || index != other_index {
-                        return Err(Error::XrefMismatch);
-                    }
-                }
-                (XrefEntry::Free, XrefEntry::Free) => {}
-                (XrefEntry::UnusableFree, XrefEntry::UnusableFree) => {}
-                _ => {
-                    assert!(
-                        std::mem::discriminant(entry) != std::mem::discriminant(other_entry),
-                        "Bug: unhandled XrefEntry variant in match"
-                    );
-                    return Err(Error::XrefMismatch);
-                }
+            if XrefEntryComparer(entry) != XrefEntryComparer(other_entry) {
+                return Err(Error::XrefMismatch);
             }
         }
 
@@ -133,11 +97,60 @@ impl<'a> DocTracker<'a> {
     }
 }
 
+struct DictTracker<'a> {
+    tracker: &'a DocTracker<'a>,
+    dict: &'a Dictionary,
+}
+
+impl<'a> DictTracker<'a> {
+    fn get_dict_deref(&self, key: &[u8]) -> Result<DictTracker<'a>> {
+        self.tracker.deref_dict(self.dict.get(key)?)
+    }
+}
+
+/// Unfortunatelly, XrefEntry does not implement PartialEq, so we have to implement ourselves.
+struct XrefEntryComparer<'a>(&'a XrefEntry);
+
+impl PartialEq for XrefEntryComparer<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        match (self.0, other.0) {
+            (
+                XrefEntry::Normal { offset, generation },
+                XrefEntry::Normal {
+                    offset: other_offset,
+                    generation: other_generation,
+                },
+            ) => offset == other_offset && generation == other_generation,
+            (
+                XrefEntry::Compressed { container, index },
+                XrefEntry::Compressed {
+                    container: other_container,
+                    index: other_index,
+                },
+            ) => container == other_container && index == other_index,
+            (XrefEntry::Free, XrefEntry::Free)
+            | (XrefEntry::UnusableFree, XrefEntry::UnusableFree) => true,
+            _ => {
+                assert!(
+                    std::mem::discriminant(self.0) != std::mem::discriminant(other.0),
+                    "Bug: unhandled XrefEntry variant in comparison"
+                );
+                false
+            }
+        }
+    }
+}
+
+pub struct Annotation {
+    pub page_idx: usize,
+    pub rect: [f32; 4],
+}
+
 pub fn verify_increment(
     curr_sig: &Signature,
     curr_doc: &Document,
     previous_doc: &Document,
-) -> Result<()> {
+) -> Result<Option<Annotation>> {
     // TODO: for soundness, check that no visual elements were
     // incrementally added to the original document before it was
     // signed. Otherwise the user could have added visual elements to
@@ -148,21 +161,21 @@ pub fn verify_increment(
 
     let prev_doc_tracker = DocTracker::new(previous_doc);
 
-    verify_catalogs(curr_sig, curr_doc, &prev_doc_tracker)?;
+    let anotation = verify_catalogs(curr_sig, curr_doc, &prev_doc_tracker)?;
 
     // All the indirect objects in the tracked list are allowed to be
     // different from the corresponding object in the current document.
     // All others must match.
     prev_doc_tracker.verify_all_changes_are_allowed(curr_doc)?;
 
-    Ok(())
+    Ok(anotation)
 }
 
 fn verify_catalogs(
     curr_sig: &Signature,
     curr_doc: &Document,
     previous_doc: &DocTracker,
-) -> Result<()> {
+) -> Result<Option<Annotation>> {
     let curr_catalog = curr_doc.catalog()?;
     let prev_catalog = previous_doc.catalog()?;
 
@@ -199,36 +212,28 @@ fn verify_catalogs(
     }
 
     // Current catalog must have an AcroForm dictionary.
-    let new_signature_id_f = verify_acro_forms(
+    verify_acro_forms(
         curr_doc,
         curr_doc.get_dict_in_dict(curr_catalog, b"AcroForm")?,
         prev_acro_form,
+        curr_sig,
     )?;
 
-    // Each page individually can be different (by one annotation, at most), but
+    // One page individually can be different (by one annotation, at most), but
     // the /Type /Pages dictionary must remain the same.
-    let new_signature_id_p = verify_pages(
+    verify_pages(
         curr_doc,
         previous_doc,
         pages.ok_or(Error::Parsing(lopdf::Error::DictKey))?,
-    )?;
-
-    if let Some(new_signature_id_p) = new_signature_id_p {
-        if new_signature_id_f != new_signature_id_p {
-            return Err(Error::TwoDifferentSignatureInIncrement);
-        }
-    }
-
-    verify_sig_annotation(curr_sig, curr_doc, new_signature_id_f)?;
-
-    Ok(())
+    )
 }
 
 fn verify_acro_forms(
     curr_doc: &Document,
     curr_acro_form: &Dictionary,
     prev_acro_form: Option<DictTracker>,
-) -> Result<ObjectId> {
+    signature: &Signature,
+) -> Result<()> {
     let mut prev_has_da = false;
     let mut prev_has_dr = false;
 
@@ -278,36 +283,62 @@ fn verify_acro_forms(
 
     // Handle the fields
     let curr_fields = curr_acro_form.get_deref(b"Fields", curr_doc)?.as_array()?;
-    let extra_signature_annotation = has_array_one_extra_ref(curr_fields, prev_fields)?;
+    let extra_form = has_array_one_extra_ref(curr_fields, prev_fields)?;
 
-    extra_signature_annotation.ok_or(Error::NotSingleArrayIncrement)
+    verify_form(curr_doc, extra_form, signature)
 }
 
-/// Gets the single extra ObjectId curr array has compared to the prev array, if any.
+/// Verifies the form field which contains the signature.
+fn verify_form(doc: &Document, form_id: ObjectId, reference_sig: &Signature) -> Result<()> {
+    todo!()
+}
+
+/// Verifies the signature itself.
+fn verify_signature(
+    doc: &Document,
+    sig_dict: &Dictionary,
+    reference_sig: &Signature,
+) -> Result<()> {
+    todo!()
+}
+
+/// Why peekable is not a trait? Let's do our own trait.
+trait Peekable {
+    type Item;
+    fn peek(&self) -> Option<&Self::Item>;
+}
+
+impl<I> Peekable for IntoIter<I> {
+    type Item = I;
+
+    fn peek(&self) -> Option<&Self::Item> {
+        self.as_slice().first()
+    }
+}
+
+/// If curr_refs elements matches all the prev_refs elements, except for one
+/// single exta element, and all elements in both arrays are references, returns
+/// the extra element.
+///
 /// Allows for reordering.
 ///
-/// Return Ok(None) if the arrays are equial.
-///
-/// Returns or Err in case of any other difference.
+/// Returns or Err in any other case.
 fn has_array_one_extra_ref(
     curr_refs: &[Object],
     prev_refs: Option<&Vec<Object>>,
-) -> Result<Option<ObjectId>> {
-    fn sort_array(array: &[Object]) -> Result<Vec<ObjectId>> {
+) -> Result<ObjectId> {
+    fn sort_array(array: &[Object]) -> Result<IntoIter<ObjectId>> {
         let mut array = array
             .iter()
             .map(|obj| obj.as_reference())
             .collect::<lopdf::Result<Vec<ObjectId>>>()?;
         array.sort();
-        Ok(array)
+        Ok(array.into_iter())
     }
 
     let prev_refs = prev_refs.map_or([].as_slice(), |prev_refs| prev_refs);
-    let prev_refs = sort_array(prev_refs)?;
-    let curr_refs = sort_array(curr_refs)?;
-
-    let mut prev_iter = prev_refs.into_iter().peekable();
-    let mut curr_iter = curr_refs.into_iter().peekable();
+    let mut prev_iter = sort_array(prev_refs)?;
+    let mut curr_iter = sort_array(curr_refs)?;
 
     while let (Some(prev), Some(curr)) = (prev_iter.peek(), curr_iter.peek()) {
         if prev != curr {
@@ -317,12 +348,8 @@ fn has_array_one_extra_ref(
         curr_iter.next();
     }
 
-    let odd_one_out = match (prev_iter.peek(), curr_iter.next()) {
-        (None, None) => None,
-        (_, odd_one_out) => odd_one_out,
-    };
-
-    if curr_iter.eq(prev_iter) {
+    let odd_one_out = curr_iter.next().ok_or(Error::NotSingleArrayIncrement)?;
+    if !curr_iter.eq(prev_iter) {
         return Err(Error::NotSingleArrayIncrement);
     }
 
@@ -333,34 +360,70 @@ fn verify_pages(
     curr_doc: &Document,
     prev_doc: &DocTracker,
     pages: &Dictionary,
-) -> Result<Option<ObjectId>> {
+) -> Result<Option<Annotation>> {
     let mut extra_annotation = None;
 
     let kids = pages.get_deref(b"Kids", curr_doc)?.as_array()?;
-    for page in kids {
-        // Ensure the page is a reference.
-        page.as_reference()?;
-
-        if let Some(extra) = verify_page(
-            curr_doc,
-            curr_doc.dereference(page)?.1.as_dict()?,
-            prev_doc.deref_dict(page)?,
-        )? {
+    for (page_idx, page) in kids.iter().enumerate() {
+        if let Some(page_id) = object_has_changed(curr_doc, prev_doc.doc, page.as_reference()?)? {
+            // Found our candidate page to contain the signature annotation.
             if extra_annotation.is_some() {
                 return Err(Error::MultiplePagesChanged);
             }
-            extra_annotation = Some(extra);
+
+            let curr_page = curr_doc.get_dictionary(page_id)?;
+            let prev_page = prev_doc.deref_dict(page)?;
+
+            extra_annotation = Some(Annotation {
+                page_idx,
+                // We need to check the page contents for the signature annotation.
+                rect: verify_page(curr_doc, page_id, curr_page, prev_page)?,
+            });
         }
     }
 
+    // The only way this is None is if no page was changed.
     Ok(extra_annotation)
+}
+
+/// Returns the first different object id in the reference chain, if any.
+fn object_has_changed(
+    curr_doc: &Document,
+    prev_doc: &Document,
+    mut id: ObjectId,
+) -> Result<Option<ObjectId>> {
+    let mut seen = HashSet::from([id.0]);
+
+    while let (Some(curr_entry), Some(prev_entry)) = (
+        curr_doc.reference_table.entries.get(&id.0),
+        prev_doc.reference_table.entries.get(&id.0),
+    ) {
+        if XrefEntryComparer(curr_entry) != XrefEntryComparer(prev_entry) {
+            return Ok(Some(id));
+        }
+
+        if let Object::Reference(next_id) = curr_doc.get_object(id)? {
+            if seen.insert(next_id.0) {
+                id = *next_id;
+            } else {
+                // We have a cycle in the reference chain.
+                return Err(Error::Parsing(lopdf::Error::ReferenceLimit));
+            }
+        } else {
+            // The original object id points to the exact same object in the new document.
+            return Ok(None);
+        }
+    }
+
+    Err(Error::Parsing(lopdf::Error::ObjectNotFound))
 }
 
 fn verify_page(
     curr_doc: &Document,
+    curr_page_id: ObjectId,
     curr_page: &Dictionary,
     prev_page: DictTracker,
-) -> Result<Option<ObjectId>> {
+) -> Result<[f32; 4]> {
     let mut extra_annotation = None;
 
     for (key, obj) in prev_page.dict.iter() {
@@ -368,12 +431,7 @@ fn verify_page(
             let curr_annots = curr_page.get_deref(b"Annots", curr_doc)?.as_array()?;
             let prev_annots = prev_page.tracker.deref(obj)?.as_array()?;
 
-            if let Some(annot) = has_array_one_extra_ref(curr_annots, Some(prev_annots))? {
-                if extra_annotation.is_some() {
-                    return Err(Error::PageMismatch);
-                }
-                extra_annotation = Some(annot);
-            }
+            extra_annotation = Some(has_array_one_extra_ref(curr_annots, Some(prev_annots))?);
         }
 
         let curr_obj = curr_page.get(key)?;
@@ -386,13 +444,16 @@ fn verify_page(
         return Err(Error::PageMismatch);
     }
 
-    Ok(extra_annotation)
+    extra_annotation
+        .ok_or(Error::Parsing(lopdf::Error::DictKey))
+        .and_then(|annot_id| verify_annotation(curr_doc, curr_page_id, annot_id))
 }
 
-fn verify_sig_annotation(
-    curr_sig: &Signature,
-    curr_doc: &Document,
-    sig_id: ObjectId,
-) -> Result<()> {
+/// Some signing software creates an annotation /Widget with the "visuals" of
+/// the signature. There is not much we can do to verify this doesn't not try to
+/// mess with the original appearance of the page, but we can at least extract
+/// the rectangle where the annotation is contained, and return it.
+fn verify_annotation(doc: &Document, page_id: ObjectId, annot_id: ObjectId) -> Result<[f32; 4]> {
+    let annot = doc.get_dictionary(annot_id)?;
     todo!()
 }
