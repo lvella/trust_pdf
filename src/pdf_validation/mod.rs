@@ -7,12 +7,8 @@ use lopdf::{xref::XrefEntry, Dictionary, Document, Object, ObjectId};
 use regex::bytes::Regex;
 use thiserror::Error;
 
-use crate::signature_validation::{CaBundle, SignerInfo};
-
 #[derive(Error, Debug)]
 pub enum Error {
-    #[error("PDF parsing error")]
-    Parsing(#[from] lopdf::Error),
     #[error("reference document does not end like a PDF file")]
     InvalidReferenceDocument,
     #[error("end of the reference increment is bigger than the signed document")]
@@ -39,7 +35,128 @@ pub enum Error {
     InternalConsistency,
 }
 
-type Result<T> = std::result::Result<T, Error>;
+type Result<T> = std::result::Result<T, anyhow::Error>;
+
+pub trait Pkcs7Verifyier {
+    type Return;
+    fn verify(&self, pkcs7_der: &[u8], signed_data: Vec<u8>) -> Result<Self::Return>;
+}
+
+/// Verifies the signatures in a PDF document, ensuring that the contents of the
+/// document matches a previous increment of the same document.
+pub fn verify<V: Pkcs7Verifyier>(
+    pdf_bytes: &[u8],
+    end_of_reference_pdf: usize,
+    signature_verifyier: V,
+) -> Result<Vec<(Option<Annotation>, V::Return)>> {
+    let doc = basic_file_buff_checks(pdf_bytes, end_of_reference_pdf)?;
+    let signatures = verify_impl(&doc, pdf_bytes, end_of_reference_pdf)?;
+
+    let mut result = Vec::new();
+
+    // Finally, we verify the signatures.
+    // TODO: add a switch to disable verifying signatures in the reference document.
+    for (annot, sig) in signatures {
+        // Openssl requires a continuous array of bytes to verify the signature,
+        // so we must concatenate the ranges.
+        let data_size = sig.coverage_end as usize - sig.skipped_range.len();
+        let mut signed_data = Vec::with_capacity(data_size);
+        signed_data.extend_from_slice(&pdf_bytes[0..sig.skipped_range.start]);
+        signed_data.extend_from_slice(&pdf_bytes[sig.skipped_range.end..sig.coverage_end as usize]);
+        assert!(signed_data.len() == data_size);
+
+        result.push((
+            annot,
+            signature_verifyier.verify(sig.pkcs7_der, signed_data)?,
+        ));
+    }
+
+    Ok(result)
+}
+
+fn basic_file_buff_checks(pdf_bytes: &[u8], end_of_reference_pdf: usize) -> Result<Document> {
+    if end_of_reference_pdf > pdf_bytes.len() {
+        return Err(Error::ReferenceIncrementOutOfBounds.into());
+    }
+
+    if !pdf_ends_with_eof(&pdf_bytes[..end_of_reference_pdf]) {
+        return Err(Error::InvalidReferenceDocument.into());
+    }
+
+    Ok(Document::load_mem(pdf_bytes)?)
+}
+
+fn verify_impl<'a>(
+    doc: &'a Document,
+    pdf_bytes: &[u8],
+    end_of_reference_pdf: usize,
+) -> Result<Vec<(Option<Annotation>, Signature<'a>)>> {
+    if end_of_reference_pdf == pdf_bytes.len() {
+        return Ok(Vec::new());
+    }
+
+    // Access the AcroForm dictionary
+    let acro_form = match doc.get_dict_in_dict(doc.catalog()?, b"AcroForm") {
+        Ok(val) => val,
+        Err(e) => return Err(e.into()),
+    };
+
+    let mut signatures = get_signature_objects(pdf_bytes, &doc, acro_form)?
+        .into_iter()
+        .map(|s| (None, s))
+        .collect::<Vec<_>>();
+
+    // Sort the signatures by decreasing coverage of the document.
+    signatures.sort_by_key(|s| -s.1.coverage_end);
+
+    // The biggest signature must cover the whole document.
+    match signatures.first() {
+        Some(last) => {
+            if last.1.coverage_end as usize != pdf_bytes.len() {
+                return Err(Error::IncompleteCoverage.into());
+            }
+        }
+        None => {
+            // There document is bigger than the reference, but there are no signatures.
+            return Err(Error::PossibleContentChange.into());
+        }
+    }
+
+    // Signatures validating ranges inside the reference document won't be
+    // subject to scrutiny on how they were added, so we filter them out for the
+    // next step.
+    let added_signatures = &signatures
+        [..signatures.partition_point(|s| s.1.coverage_end as usize > end_of_reference_pdf)];
+
+    // An iterator in decreasing order over the incremental updates we are comparing against.
+    let incremental_updates = added_signatures[1..]
+        .iter()
+        .map(|s| s.1.coverage_end as usize)
+        .chain([end_of_reference_pdf]);
+
+    // Ensures that the incremental updates were added correctly.
+    {
+        const SIZE: usize = std::mem::size_of::<Document>();
+        println!("SIZE: {}", SIZE);
+
+        let mut tmp_storage;
+        let mut curr_doc = doc;
+        for ((annot, sig), previous_doc) in added_signatures.iter_mut().zip(incremental_updates) {
+            // Signature offset must be after the previous document.
+            if (sig.offset as usize) < previous_doc {
+                return Err(Error::InvalidSignatureObject.into());
+            }
+
+            let previous_doc = Document::load_mem(&pdf_bytes[..previous_doc])?;
+            *annot = increment_validation::verify_increment(sig, curr_doc, &previous_doc)?;
+
+            tmp_storage = previous_doc;
+            curr_doc = &tmp_storage;
+        }
+    }
+
+    Ok(signatures)
+}
 
 struct ExactArrayOrNone<T, const N: usize>(Option<[T; N]>);
 
@@ -55,11 +172,11 @@ impl<T, const N: usize> FromIterator<T> for ExactArrayOrNone<T, N> {
 /// Verifies the signatures in a PDF document, assembled by concatenating an
 /// incremental update to the reference document. Ensures that the contents of
 /// the final document matches the reference.
-pub fn verify_incremental_update(
+pub fn verify_incremental_update<V: Pkcs7Verifyier>(
     reference_pdf_bytes: impl AsRef<[u8]>,
     incremental_update_bytes: impl AsRef<[u8]>,
-    ca_bundle: &CaBundle,
-) -> Result<Vec<SignerInfo>> {
+    signature_verifyier: V,
+) -> Result<Vec<(Option<Annotation>, V::Return)>> {
     let reference = reference_pdf_bytes.as_ref();
     let incremental_update = incremental_update_bytes.as_ref();
 
@@ -69,26 +186,26 @@ pub fn verify_incremental_update(
     drop(reference_pdf_bytes);
     drop(incremental_update_bytes);
 
-    verify(&full_pdf, end_of_reference_pdf, ca_bundle)
+    verify(&full_pdf, end_of_reference_pdf, signature_verifyier)
 }
 
 /// Verifies the signatures in a PDF document, ensuring that the contents of the
 /// document matches the reference document.
-pub fn verify_from_reference(
+pub fn verify_from_reference<V: Pkcs7Verifyier>(
     reference_pdf_bytes: impl AsRef<[u8]>,
     signed_pdf_bytes: impl AsRef<[u8]>,
-    ca_bundle: &CaBundle,
-) -> Result<Vec<SignerInfo>> {
+    signature_verifyier: V,
+) -> Result<Vec<(Option<Annotation>, V::Return)>> {
     let signed = signed_pdf_bytes.as_ref();
     let reference = reference_pdf_bytes.as_ref();
 
     if !signed.starts_with(reference) {
-        return Err(Error::PossibleContentChange);
+        return Err(Error::PossibleContentChange.into());
     }
     let end_of_reference_pdf = reference.len();
     drop(reference_pdf_bytes);
 
-    verify(signed, end_of_reference_pdf, ca_bundle)
+    verify(signed, end_of_reference_pdf, signature_verifyier)
 }
 
 struct Signature<'a> {
@@ -97,106 +214,6 @@ struct Signature<'a> {
     coverage_end: i64,
     skipped_range: Range<usize>,
     pkcs7_der: &'a [u8],
-}
-
-/// Verifies the signatures in a PDF document, ensuring that the contents of the
-/// document matches a previous increment of the same document.
-pub fn verify(
-    pdf_bytes: &[u8],
-    end_of_reference_pdf: usize,
-    ca_bundle: &CaBundle,
-) -> Result<Vec<SignerInfo>> {
-    if end_of_reference_pdf > pdf_bytes.len() {
-        return Err(Error::ReferenceIncrementOutOfBounds);
-    }
-    if !pdf_ends_with_eof(&pdf_bytes[..end_of_reference_pdf]) {
-        return Err(Error::InvalidReferenceDocument);
-    }
-
-    let doc = Document::load_mem(pdf_bytes)?;
-
-    let mut result = Vec::new();
-
-    // Access the AcroForm dictionary
-    let acro_form = match doc.get_dict_in_dict(doc.catalog()?, b"AcroForm") {
-        Ok(val) => val,
-        Err(lopdf::Error::DictKey) => return Ok(result),
-        Err(e) => return Err(e.into()),
-    };
-
-    let mut signatures = get_signature_objects(pdf_bytes, &doc, acro_form)?;
-
-    // Sort the signatures by decreasing coverage of the document.
-    signatures.sort_by_key(|s| -s.coverage_end);
-
-    // The biggest signature must cover the whole document.
-    match signatures.first() {
-        Some(last) => {
-            if last.coverage_end as usize != pdf_bytes.len() {
-                return Err(Error::IncompleteCoverage);
-            }
-        }
-        None => {
-            if end_of_reference_pdf == pdf_bytes.len() {
-                // If there are no signatures, the document must be the same as the reference.
-                return Ok(result);
-            } else {
-                // There document is bigger than the reference, but there are no signatures.
-                return Err(Error::PossibleContentChange);
-            }
-        }
-    }
-
-    // Signatures validating ranges inside the reference document won't be
-    // subject to scrutiny on how they were added, so we filter them out for the
-    // next step.
-    let added_signatures = &signatures
-        [..signatures.partition_point(|s| s.coverage_end as usize > end_of_reference_pdf)];
-
-    // An iterator in decreasing order over the incremental updates we are comparing against.
-    let incremental_updates = added_signatures[1..]
-        .iter()
-        .map(|s| s.coverage_end as usize)
-        .chain([end_of_reference_pdf]);
-
-    // Ensures that the incremental updates were added correctly.
-    {
-        let mut tmp_storage;
-        let mut curr_doc = &doc;
-        for (sig, previous_doc) in added_signatures.iter().zip(incremental_updates) {
-            // Signature offset must be after the previous document.
-            if (sig.offset as usize) < previous_doc {
-                return Err(Error::InvalidSignatureObject);
-            }
-
-            let previous_doc = Box::new(Document::load_mem(&pdf_bytes[..previous_doc])?);
-            let annotation = increment_validation::verify_increment(sig, curr_doc, &previous_doc)?;
-
-            tmp_storage = previous_doc;
-            curr_doc = &tmp_storage;
-        }
-    }
-
-    // Finally, we verify the signatures.
-    // TODO: add a switch to disable verifying signatures in the reference document.
-    for sig in signatures {
-        // Openssl requires a continuous array of bytes to verify the signature,
-        // so we must concatenate the ranges.
-        let data_size = sig.coverage_end as usize - sig.skipped_range.len();
-        let mut signed_data = Vec::with_capacity(data_size);
-        signed_data.extend_from_slice(&pdf_bytes[0..sig.skipped_range.start]);
-        signed_data.extend_from_slice(&pdf_bytes[sig.skipped_range.end..sig.coverage_end as usize]);
-        assert!(signed_data.len() == data_size);
-
-        let signature = crate::signature_validation::Signature::new(sig.pkcs7_der)?;
-
-        result.extend(signature.get_signers_info()?);
-
-        // Verify the signature
-        signature.verify(&signed_data, ca_bundle)?;
-    }
-
-    Ok(result)
 }
 
 fn get_signature_objects<'a>(
@@ -232,7 +249,7 @@ fn process_signature<'a>(
 ) -> Result<Signature<'a>> {
     let (Some(obj_id), Object::Dictionary(signature)) = doc.dereference(sig_reference)? else {
         // Signature object must be an indirect dictionary.
-        return Err(Error::InvalidSignatureObject);
+        return Err(Error::InvalidSignatureObject.into());
     };
 
     let signed_range = signature
@@ -247,7 +264,7 @@ fn process_signature<'a>(
     // For soundness, we must ensure the signature covers the file since the
     // beginning.
     if signed_range[0] != 0 {
-        return Err(Error::WrongRangeStart);
+        return Err(Error::WrongRangeStart.into());
     }
 
     // The signature object must be inside the signed range.
@@ -259,25 +276,25 @@ fn process_signature<'a>(
         )? {
         if *generation != obj_id.1 {
             // The generation is known, so it must match the entry in the xref table.
-            return Err(Error::InternalConsistency);
+            return Err(Error::InternalConsistency.into());
         }
         if *offset as i64 >= signed_range[1] {
-            return Err(Error::InvalidCoverage);
+            return Err(Error::InvalidCoverage.into());
         }
         *offset
     } else {
-        return Err(Error::InvalidSignatureObject);
+        return Err(Error::InvalidSignatureObject.into());
     };
 
     // Sanity check that the range is well formed and inside the document.
     for &range in &signed_range[1..] {
         if range < 0 {
-            return Err(Error::InvalidRange);
+            return Err(Error::InvalidRange.into());
         }
     }
     let signed_range_end = signed_range[2] + signed_range[3];
     if signed_range[1] > signed_range[2] || signed_range_end > pdf_bytes.len() as i64 {
-        return Err(Error::InvalidRange);
+        return Err(Error::InvalidRange.into());
     }
 
     // The /Contents field must match the bytes skipped in the signed range, which must be hex encoded.
@@ -286,12 +303,12 @@ fn process_signature<'a>(
             .ok_or(Error::InvalidCoverage)?;
     let pkcs7_signature = signature.get_deref(b"Contents", doc)?.as_str()?;
     if pkcs7_signature != skipped_bytes {
-        return Err(Error::InvalidCoverage);
+        return Err(Error::InvalidCoverage.into());
     }
 
     // Tests if the signature range ends with the PDF end marker (%%EOF).
     if !pdf_ends_with_eof(&pdf_bytes[..signed_range_end as usize]) {
-        return Err(Error::WrongRangeEnd);
+        return Err(Error::WrongRangeEnd.into());
     }
 
     Ok(Signature {

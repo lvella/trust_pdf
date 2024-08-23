@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+anyhow = "1.0"
 array-init = "2.1"
 lazy_static = "1.5"
 lopdf = "0.33"

@@ -25,6 +25,10 @@ pub enum Error {
     PageMismatch,
     #[error("invalid annotation")]
     InvalidAnnotation,
+    #[error("invalid form")]
+    InvalidForm,
+    #[error("signature dictionary was modified")]
+    SignatureModified,
     #[error("mismatch between xref tables")]
     XrefMismatch,
 }
@@ -161,9 +165,24 @@ pub fn verify_increment(
     curr_doc: &Document,
     previous_doc: &Document,
 ) -> Result<Option<Annotation>> {
+    // check the reference signature id has the expected offset in the xref table
+    let xref_entry = curr_doc
+        .reference_table
+        .entries
+        .get(&curr_sig.obj_id.0)
+        .ok_or(Error::SignatureModified)?;
+    if XrefEntryComparer(xref_entry)
+        != XrefEntryComparer(&XrefEntry::Normal {
+            offset: curr_sig.offset,
+            generation: curr_sig.obj_id.1,
+        })
+    {
+        return Err(Error::SignatureModified);
+    }
+
     let prev_doc_tracker = DocTracker::new(previous_doc);
 
-    let anotation = verify_catalogs(curr_sig, curr_doc, &prev_doc_tracker)?;
+    let anotation = verify_catalogs(curr_sig.obj_id, curr_doc, &prev_doc_tracker)?;
 
     // All the indirect objects in the tracked list are allowed to be
     // different from the corresponding object in the current document.
@@ -174,7 +193,7 @@ pub fn verify_increment(
 }
 
 fn verify_catalogs(
-    curr_sig: &Signature,
+    curr_sig_id: ObjectId,
     curr_doc: &Document,
     previous_doc: &DocTracker,
 ) -> Result<Option<Annotation>> {
@@ -218,7 +237,7 @@ fn verify_catalogs(
         curr_doc,
         curr_doc.get_dict_in_dict(curr_catalog, b"AcroForm")?,
         prev_acro_form,
-        curr_sig,
+        curr_sig_id,
     )?;
 
     // One page individually can be different (by one annotation, at most), but
@@ -234,7 +253,7 @@ fn verify_acro_forms(
     curr_doc: &Document,
     curr_acro_form: &Dictionary,
     prev_acro_form: Option<DictTracker>,
-    signature: &Signature,
+    signature: ObjectId,
 ) -> Result<()> {
     let mut prev_has_da = false;
     let mut prev_has_dr = false;
@@ -291,11 +310,20 @@ fn verify_acro_forms(
 }
 
 /// Verifies the form field which contains the signature.
-fn verify_form(doc: &Document, form_id: ObjectId, reference_sig: &Signature) -> Result<()> {
-    // TODO: check /FT is /Sig
-    // TODO: check /V is the reference signature id
-    // TODO: check the reference signature id has the expected offset in the xref table (this could be done much early, in the toplevel function).
-    todo!()
+fn verify_form(doc: &Document, form_id: ObjectId, reference_sig: ObjectId) -> Result<()> {
+    let form = doc.get_dictionary(form_id)?;
+
+    // check /FT is /Sig
+    if form.get_deref(b"FT", doc)?.as_name()? != b"Sig" {
+        return Err(Error::InvalidForm);
+    }
+
+    // check /V is the reference signature id
+    if form.get(b"V")?.as_reference()? != reference_sig {
+        return Err(Error::InvalidForm);
+    }
+
+    Ok(())
 }
 
 /// Why peekable is not a trait? Let's do our own trait.
