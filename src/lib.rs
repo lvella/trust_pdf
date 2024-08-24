@@ -1,3 +1,6 @@
+#[cfg(feature = "openssl")]
+pub mod openssl;
+
 mod increment_validation;
 
 use std::ops::Range;
@@ -15,8 +18,6 @@ pub enum Error {
     ReferenceIncrementOutOfBounds,
     #[error("can not guarantee the contents of the signed document match the original")]
     PossibleContentChange,
-    #[error("signature verification error")]
-    SignatureVerification(#[from] crate::signature_validation::Error),
     #[error("invalid signature object")]
     InvalidSignatureObject,
     #[error("file is not signed from the beginning")]
@@ -30,24 +31,22 @@ pub enum Error {
     #[error("last signature does not cover the whole document")]
     IncompleteCoverage,
     #[error("can not ensure that the incremental update didn't change the document")]
-    PossibleIncrementalChange(#[from] increment_validation::Error),
-    #[error("we encountered an internal consistency error, this is a bug that should be reported")]
     InternalConsistency,
 }
 
-type Result<T> = std::result::Result<T, anyhow::Error>;
+pub type Result<T> = anyhow::Result<T>;
 
-pub trait Pkcs7Verifyier {
+pub trait Pkcs7Verifier {
     type Return;
     fn verify(&self, pkcs7_der: &[u8], signed_data: Vec<u8>) -> Result<Self::Return>;
 }
 
 /// Verifies the signatures in a PDF document, ensuring that the contents of the
 /// document matches a previous increment of the same document.
-pub fn verify<V: Pkcs7Verifyier>(
+pub fn verify<V: Pkcs7Verifier>(
     pdf_bytes: &[u8],
     end_of_reference_pdf: usize,
-    signature_verifyier: V,
+    signature_verifier: V,
 ) -> Result<Vec<(Option<Annotation>, V::Return)>> {
     let doc = basic_file_buff_checks(pdf_bytes, end_of_reference_pdf)?;
     let signatures = verify_impl(&doc, pdf_bytes, end_of_reference_pdf)?;
@@ -67,7 +66,7 @@ pub fn verify<V: Pkcs7Verifyier>(
 
         result.push((
             annot,
-            signature_verifyier.verify(sig.pkcs7_der, signed_data)?,
+            signature_verifier.verify(sig.pkcs7_der, signed_data)?,
         ));
     }
 
@@ -172,10 +171,10 @@ impl<T, const N: usize> FromIterator<T> for ExactArrayOrNone<T, N> {
 /// Verifies the signatures in a PDF document, assembled by concatenating an
 /// incremental update to the reference document. Ensures that the contents of
 /// the final document matches the reference.
-pub fn verify_incremental_update<V: Pkcs7Verifyier>(
+pub fn verify_incremental_update<V: Pkcs7Verifier>(
     reference_pdf_bytes: impl AsRef<[u8]>,
     incremental_update_bytes: impl AsRef<[u8]>,
-    signature_verifyier: V,
+    signature_verifier: V,
 ) -> Result<Vec<(Option<Annotation>, V::Return)>> {
     let reference = reference_pdf_bytes.as_ref();
     let incremental_update = incremental_update_bytes.as_ref();
@@ -186,15 +185,15 @@ pub fn verify_incremental_update<V: Pkcs7Verifyier>(
     drop(reference_pdf_bytes);
     drop(incremental_update_bytes);
 
-    verify(&full_pdf, end_of_reference_pdf, signature_verifyier)
+    verify(&full_pdf, end_of_reference_pdf, signature_verifier)
 }
 
 /// Verifies the signatures in a PDF document, ensuring that the contents of the
 /// document matches the reference document.
-pub fn verify_from_reference<V: Pkcs7Verifyier>(
+pub fn verify_from_reference<V: Pkcs7Verifier>(
     reference_pdf_bytes: impl AsRef<[u8]>,
     signed_pdf_bytes: impl AsRef<[u8]>,
-    signature_verifyier: V,
+    signature_verifier: V,
 ) -> Result<Vec<(Option<Annotation>, V::Return)>> {
     let signed = signed_pdf_bytes.as_ref();
     let reference = reference_pdf_bytes.as_ref();
@@ -205,7 +204,7 @@ pub fn verify_from_reference<V: Pkcs7Verifyier>(
     let end_of_reference_pdf = reference.len();
     drop(reference_pdf_bytes);
 
-    verify(signed, end_of_reference_pdf, signature_verifyier)
+    verify(signed, end_of_reference_pdf, signature_verifier)
 }
 
 struct Signature<'a> {

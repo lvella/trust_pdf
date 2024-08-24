@@ -1,4 +1,4 @@
-use crate::pdf_validation::ExactArrayOrNone;
+use crate::ExactArrayOrNone;
 
 use super::Signature;
 use lopdf::{xref::XrefEntry, Dictionary, Document, Object, ObjectId};
