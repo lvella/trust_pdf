@@ -5,6 +5,7 @@ mod increment_validation;
 
 use std::ops::Range;
 
+use anyhow::Result;
 use increment_validation::Annotation;
 use lopdf::{xref::XrefEntry, Dictionary, Document, Object, ObjectId};
 use regex::bytes::Regex;
@@ -34,11 +35,54 @@ pub enum Error {
     InternalConsistency,
 }
 
-pub type Result<T> = anyhow::Result<T>;
-
 pub trait Pkcs7Verifier {
     type Return;
-    fn verify(&self, pkcs7_der: &[u8], signed_data: Vec<u8>) -> Result<Self::Return>;
+    fn verify(&self, pkcs7_der: &[u8], signed_data: [&[u8]; 2]) -> Result<Self::Return>;
+}
+
+pub struct SignatureInfo<T> {
+    pub annotation: Option<Annotation>,
+    pub signed_byte_ranges: [Range<usize>; 2],
+    pub signature_verifier_result: T,
+}
+
+/// Verifies the signatures in a PDF document, assembled by concatenating an
+/// incremental update to the reference document. Ensures that the contents of
+/// the final document matches the reference.
+pub fn verify_incremental_update<V: Pkcs7Verifier>(
+    reference_pdf_bytes: impl AsRef<[u8]>,
+    incremental_update_bytes: impl AsRef<[u8]>,
+    signature_verifier: V,
+) -> Result<Vec<SignatureInfo<V::Return>>> {
+    let reference = reference_pdf_bytes.as_ref();
+    let incremental_update = incremental_update_bytes.as_ref();
+
+    let full_pdf = [reference, incremental_update].concat();
+    let end_of_reference_pdf = reference.len();
+
+    drop(reference_pdf_bytes);
+    drop(incremental_update_bytes);
+
+    verify(&full_pdf, end_of_reference_pdf, signature_verifier)
+}
+
+/// Verifies the signatures in a PDF document, ensuring that the contents of the
+/// document matches the reference document.
+pub fn verify_from_reference<V: Pkcs7Verifier>(
+    reference_pdf_bytes: impl AsRef<[u8]>,
+    signed_pdf_bytes: impl AsRef<[u8]>,
+    signature_verifier: V,
+) -> Result<Vec<SignatureInfo<V::Return>>> {
+    let signed = signed_pdf_bytes.as_ref();
+    let reference = reference_pdf_bytes.as_ref();
+
+    if !signed.starts_with(reference) {
+        return Err(Error::PossibleContentChange.into());
+    }
+    let end_of_reference_pdf = reference.len();
+    drop(reference_pdf_bytes);
+
+    verify(signed, end_of_reference_pdf, signature_verifier)
 }
 
 /// Verifies the signatures in a PDF document, ensuring that the contents of the
@@ -47,7 +91,7 @@ pub fn verify<V: Pkcs7Verifier>(
     pdf_bytes: &[u8],
     end_of_reference_pdf: usize,
     signature_verifier: V,
-) -> Result<Vec<(Option<Annotation>, V::Return)>> {
+) -> Result<Vec<SignatureInfo<V::Return>>> {
     let doc = basic_file_buff_checks(pdf_bytes, end_of_reference_pdf)?;
     let signatures = verify_impl(&doc, pdf_bytes, end_of_reference_pdf)?;
 
@@ -55,19 +99,19 @@ pub fn verify<V: Pkcs7Verifier>(
 
     // Finally, we verify the signatures.
     // TODO: add a switch to disable verifying signatures in the reference document.
-    for (annot, sig) in signatures {
-        // Openssl requires a continuous array of bytes to verify the signature,
-        // so we must concatenate the ranges.
-        let data_size = sig.coverage_end as usize - sig.skipped_range.len();
-        let mut signed_data = Vec::with_capacity(data_size);
-        signed_data.extend_from_slice(&pdf_bytes[0..sig.skipped_range.start]);
-        signed_data.extend_from_slice(&pdf_bytes[sig.skipped_range.end..sig.coverage_end as usize]);
-        assert!(signed_data.len() == data_size);
+    for (annotation, sig) in signatures {
+        let signed_byte_ranges = [
+            0..sig.skipped_range.start,
+            sig.skipped_range.end..sig.coverage_end as usize,
+        ];
 
-        result.push((
-            annot,
-            signature_verifier.verify(sig.pkcs7_der, signed_data)?,
-        ));
+        let signed_slices = signed_byte_ranges.clone().map(|r| &pdf_bytes[r]);
+
+        result.push(SignatureInfo {
+            annotation,
+            signed_byte_ranges,
+            signature_verifier_result: signature_verifier.verify(sig.pkcs7_der, signed_slices)?,
+        });
     }
 
     Ok(result)
@@ -100,18 +144,15 @@ fn verify_impl<'a>(
         Err(e) => return Err(e.into()),
     };
 
-    let mut signatures = get_signature_objects(pdf_bytes, &doc, acro_form)?
-        .into_iter()
-        .map(|s| (None, s))
-        .collect::<Vec<_>>();
+    let mut signatures = get_signature_objects(pdf_bytes, doc, acro_form)?;
 
     // Sort the signatures by decreasing coverage of the document.
-    signatures.sort_by_key(|s| -s.1.coverage_end);
+    signatures.sort_by_key(|s| -s.coverage_end);
 
     // The biggest signature must cover the whole document.
     match signatures.first() {
         Some(last) => {
-            if last.1.coverage_end as usize != pdf_bytes.len() {
+            if last.coverage_end as usize != pdf_bytes.len() {
                 return Err(Error::IncompleteCoverage.into());
             }
         }
@@ -125,36 +166,47 @@ fn verify_impl<'a>(
     // subject to scrutiny on how they were added, so we filter them out for the
     // next step.
     let added_signatures = &signatures
-        [..signatures.partition_point(|s| s.1.coverage_end as usize > end_of_reference_pdf)];
+        [..signatures.partition_point(|s| s.coverage_end as usize > end_of_reference_pdf)];
 
     // An iterator in decreasing order over the incremental updates we are comparing against.
     let incremental_updates = added_signatures[1..]
         .iter()
-        .map(|s| s.1.coverage_end as usize)
+        .map(|s| s.coverage_end as usize)
         .chain([end_of_reference_pdf]);
 
     // Ensures that the incremental updates were added correctly.
+    let mut annotations = Vec::new();
     {
         const SIZE: usize = std::mem::size_of::<Document>();
         println!("SIZE: {}", SIZE);
 
         let mut tmp_storage;
         let mut curr_doc = doc;
-        for ((annot, sig), previous_doc) in added_signatures.iter_mut().zip(incremental_updates) {
+        for (sig, previous_doc) in added_signatures.iter().zip(incremental_updates) {
             // Signature offset must be after the previous document.
             if (sig.offset as usize) < previous_doc {
                 return Err(Error::InvalidSignatureObject.into());
             }
 
             let previous_doc = Document::load_mem(&pdf_bytes[..previous_doc])?;
-            *annot = increment_validation::verify_increment(sig, curr_doc, &previous_doc)?;
+            let annot = increment_validation::verify_increment(sig, curr_doc, &previous_doc)?;
+            annotations.push(annot);
 
             tmp_storage = previous_doc;
             curr_doc = &tmp_storage;
         }
     }
 
-    Ok(signatures)
+    // Join annotations with the signatures in a single vector.
+    //
+    // Since annotations may be smaller than the signatures, we must pad the
+    // the beginning of the vector with None.
+    let extra_none_count = signatures.len() - annotations.len();
+    let padded_annotations = std::iter::repeat_with(|| None)
+        .take(extra_none_count)
+        .chain(annotations);
+
+    Ok(padded_annotations.zip(signatures).collect())
 }
 
 struct ExactArrayOrNone<T, const N: usize>(Option<[T; N]>);
@@ -166,45 +218,6 @@ impl<T, const N: usize> FromIterator<T> for ExactArrayOrNone<T, N> {
         let result = if iter.next().is_none() { result } else { None };
         ExactArrayOrNone(result)
     }
-}
-
-/// Verifies the signatures in a PDF document, assembled by concatenating an
-/// incremental update to the reference document. Ensures that the contents of
-/// the final document matches the reference.
-pub fn verify_incremental_update<V: Pkcs7Verifier>(
-    reference_pdf_bytes: impl AsRef<[u8]>,
-    incremental_update_bytes: impl AsRef<[u8]>,
-    signature_verifier: V,
-) -> Result<Vec<(Option<Annotation>, V::Return)>> {
-    let reference = reference_pdf_bytes.as_ref();
-    let incremental_update = incremental_update_bytes.as_ref();
-
-    let full_pdf = [reference, incremental_update].concat();
-    let end_of_reference_pdf = reference.len();
-
-    drop(reference_pdf_bytes);
-    drop(incremental_update_bytes);
-
-    verify(&full_pdf, end_of_reference_pdf, signature_verifier)
-}
-
-/// Verifies the signatures in a PDF document, ensuring that the contents of the
-/// document matches the reference document.
-pub fn verify_from_reference<V: Pkcs7Verifier>(
-    reference_pdf_bytes: impl AsRef<[u8]>,
-    signed_pdf_bytes: impl AsRef<[u8]>,
-    signature_verifier: V,
-) -> Result<Vec<(Option<Annotation>, V::Return)>> {
-    let signed = signed_pdf_bytes.as_ref();
-    let reference = reference_pdf_bytes.as_ref();
-
-    if !signed.starts_with(reference) {
-        return Err(Error::PossibleContentChange.into());
-    }
-    let end_of_reference_pdf = reference.len();
-    drop(reference_pdf_bytes);
-
-    verify(signed, end_of_reference_pdf, signature_verifier)
 }
 
 struct Signature<'a> {

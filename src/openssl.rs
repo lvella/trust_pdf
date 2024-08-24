@@ -33,15 +33,21 @@ impl OpenSslVerifier {
     }
 }
 
-impl super::Pkcs7Verifier for OpenSslVerifier {
+impl super::Pkcs7Verifier for &OpenSslVerifier {
     type Return = Pkcs7;
 
-    fn verify(&self, pkcs7_der: &[u8], signed_data: Vec<u8>) -> anyhow::Result<Self::Return> {
+    fn verify(&self, pkcs7_der: &[u8], signed_data: [&[u8]; 2]) -> anyhow::Result<Self::Return> {
+        // Unfortunately OpenSSL requires a contiguous array of bytes to verify
+        // the signature, so we must allocate and copy the slices.
+        let mut contiguous = Vec::with_capacity(signed_data[0].len() + signed_data[1].len());
+        contiguous.extend_from_slice(signed_data[0]);
+        contiguous.extend_from_slice(signed_data[1]);
+
         let pkcs7 = Pkcs7::from_der(pkcs7_der)?;
         pkcs7.verify(
             &self.intermediaries,
             &self.ca_store,
-            Some(&signed_data),
+            Some(&contiguous),
             None,
             Pkcs7Flags::empty(),
         )?;
@@ -65,39 +71,40 @@ pub fn load_ca_bundle_from_dir(dir: &Path) -> Result<X509Store, anyhow::Error> {
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, path::Path};
+
+    use openssl::stack::Stack;
+
     use super::OpenSslVerifier;
 
-    fn create_validator() -> OpenSslVerifier {
-        todo!()
+    fn create_signature_verifier() -> OpenSslVerifier {
+        let certs_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("test_data/trusted_CAs");
+
+        let ca_store = super::load_ca_bundle_from_dir(&certs_dir).unwrap();
+        let intermediaries = Stack::new().unwrap();
+        OpenSslVerifier::new(ca_store, intermediaries)
     }
 
     #[test]
     fn test_valid_pdfs() {
-        todo!()
+        let verifier = create_signature_verifier();
+        let pdfs_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("test_data/valid_modification");
+
+        let unsigned = fs::read(pdfs_dir.join("unsigned.pdf")).unwrap();
+
+        // Test visible signature
+        {
+            let signed_visible = fs::read(pdfs_dir.join("signed-visible.pdf")).unwrap();
+            let result = crate::verify_from_reference(unsigned, signed_visible, &verifier).unwrap();
+            assert_eq!(result.len(), 1);
+            let annot = result[0].annotation.as_ref().unwrap();
+            assert_eq!(annot.page_idx, 0);
+            println!("Annotation box {:?}", annot.rect);
+        }
     }
 
     #[test]
     fn test_invalid_pdfs() {
         todo!()
-    }
-}
-
-pub struct CaBundle(X509Store);
-
-impl CaBundle {
-    pub fn load() -> Self {
-        // TODO: somehow configure where the trusted CAs are stored
-        let certs_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("trusted-CAs");
-        let mut builder = X509StoreBuilder::new().unwrap();
-
-        // Load every certificate in the trusted CAs directory
-        for entry in std::fs::read_dir(certs_dir).unwrap() {
-            let entry = entry.unwrap();
-            let path = entry.path();
-            let cert = X509::from_pem(&std::fs::read(&path).unwrap()).unwrap();
-            builder.add_cert(cert).unwrap();
-        }
-
-        Self(builder.build())
     }
 }

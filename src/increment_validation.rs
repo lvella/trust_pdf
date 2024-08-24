@@ -1,6 +1,7 @@
 use crate::ExactArrayOrNone;
 
 use super::Signature;
+use anyhow::Result;
 use lopdf::{xref::XrefEntry, Dictionary, Document, Object, ObjectId};
 use std::{
     cell::RefCell,
@@ -11,8 +12,6 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum Error {
-    #[error("PDF parsing error")]
-    Parsing(#[from] lopdf::Error),
     #[error("mismatch between /Catalog dictionaries")]
     CatalogMismatch,
     #[error("mismatch between /AcroForm dictionaries")]
@@ -32,8 +31,6 @@ pub enum Error {
     #[error("mismatch between xref tables")]
     XrefMismatch,
 }
-
-pub type Result<T> = std::result::Result<T, Error>;
 
 struct DocTracker<'a> {
     traversed: RefCell<HashMap<u32, u16>>,
@@ -59,7 +56,7 @@ impl<'a> DocTracker<'a> {
     fn get(&self, id: ObjectId) -> Result<&Object> {
         if let Some(gen) = self.traversed.borrow_mut().insert(id.0, id.1) {
             if gen != id.1 {
-                return Err(Error::Parsing(lopdf::Error::ObjectIdMismatch));
+                return Err(lopdf::Error::ObjectIdMismatch.into());
             }
         }
         Ok(self.doc.get_object(id)?)
@@ -93,11 +90,11 @@ impl<'a> DocTracker<'a> {
             }
 
             let Some(other_entry) = other.reference_table.entries.get(id) else {
-                return Err(Error::XrefMismatch);
+                return Err(Error::XrefMismatch.into());
             };
 
             if XrefEntryComparer(entry) != XrefEntryComparer(other_entry) {
-                return Err(Error::XrefMismatch);
+                return Err(Error::XrefMismatch.into());
             }
         }
 
@@ -177,7 +174,7 @@ pub fn verify_increment(
             generation: curr_sig.obj_id.1,
         })
     {
-        return Err(Error::SignatureModified);
+        return Err(Error::SignatureModified.into());
     }
 
     let prev_doc_tracker = DocTracker::new(previous_doc);
@@ -223,13 +220,13 @@ fn verify_catalogs(
 
         let curr_obj = curr_catalog.get(key)?;
         if curr_obj != obj {
-            return Err(Error::CatalogMismatch);
+            return Err(Error::CatalogMismatch.into());
         }
     }
 
     // All the elements from both catalogs must have matched.
     if prev_catalog.dict.len() + size_diff != curr_catalog.len() {
-        return Err(Error::CatalogMismatch);
+        return Err(Error::CatalogMismatch.into());
     }
 
     // Current catalog must have an AcroForm dictionary.
@@ -242,11 +239,7 @@ fn verify_catalogs(
 
     // One page individually can be different (by one annotation, at most), but
     // the /Type /Pages dictionary must remain the same.
-    verify_pages(
-        curr_doc,
-        previous_doc,
-        pages.ok_or(Error::Parsing(lopdf::Error::DictKey))?,
-    )
+    verify_pages(curr_doc, previous_doc, pages.ok_or(lopdf::Error::DictKey)?)
 }
 
 fn verify_acro_forms(
@@ -276,7 +269,7 @@ fn verify_acro_forms(
 
             let curr_obj = curr_acro_form.get(key)?;
             if curr_obj != obj {
-                return Err(Error::AcroFormMismatch);
+                return Err(Error::AcroFormMismatch.into());
             }
         }
         prev_acro_form.dict.len()
@@ -299,7 +292,7 @@ fn verify_acro_forms(
     }
 
     if curr_acro_form.len() != allowed_len {
-        return Err(Error::AcroFormMismatch);
+        return Err(Error::AcroFormMismatch.into());
     }
 
     // Handle the fields
@@ -315,12 +308,12 @@ fn verify_form(doc: &Document, form_id: ObjectId, reference_sig: ObjectId) -> Re
 
     // check /FT is /Sig
     if form.get_deref(b"FT", doc)?.as_name()? != b"Sig" {
-        return Err(Error::InvalidForm);
+        return Err(Error::InvalidForm.into());
     }
 
     // check /V is the reference signature id
     if form.get(b"V")?.as_reference()? != reference_sig {
-        return Err(Error::InvalidForm);
+        return Err(Error::InvalidForm.into());
     }
 
     Ok(())
@@ -374,7 +367,7 @@ fn has_array_one_extra_ref(
 
     let odd_one_out = curr_iter.next().ok_or(Error::NotSingleArrayIncrement)?;
     if !curr_iter.eq(prev_iter) {
-        return Err(Error::NotSingleArrayIncrement);
+        return Err(Error::NotSingleArrayIncrement.into());
     }
 
     Ok(odd_one_out)
@@ -392,7 +385,7 @@ fn verify_pages(
         if let Some(page_id) = object_has_changed(curr_doc, prev_doc.doc, page.as_reference()?)? {
             // Found our candidate page to contain the signature annotation.
             if extra_annotation.is_some() {
-                return Err(Error::MultiplePagesChanged);
+                return Err(Error::MultiplePagesChanged.into());
             }
 
             let curr_page = curr_doc.get_dictionary(page_id)?;
@@ -431,7 +424,7 @@ fn object_has_changed(
                 id = *next_id;
             } else {
                 // We have a cycle in the reference chain.
-                return Err(Error::Parsing(lopdf::Error::ReferenceLimit));
+                return Err(lopdf::Error::ReferenceLimit.into());
             }
         } else {
             // The original object id points to the exact same object in the new document.
@@ -439,7 +432,7 @@ fn object_has_changed(
         }
     }
 
-    Err(Error::Parsing(lopdf::Error::ObjectNotFound))
+    Err(lopdf::Error::ObjectNotFound.into())
 }
 
 fn verify_page(
@@ -460,16 +453,16 @@ fn verify_page(
 
         let curr_obj = curr_page.get(key)?;
         if curr_obj != obj {
-            return Err(Error::PageMismatch);
+            return Err(Error::PageMismatch.into());
         }
     }
 
     if curr_page.len() != prev_page.dict.len() {
-        return Err(Error::PageMismatch);
+        return Err(Error::PageMismatch.into());
     }
 
     extra_annotation
-        .ok_or(Error::Parsing(lopdf::Error::DictKey))
+        .ok_or(lopdf::Error::DictKey.into())
         .and_then(|annot_id| verify_annotation(curr_doc, curr_page_id, annot_id))
 }
 
@@ -484,24 +477,24 @@ fn verify_annotation(doc: &Document, page_id: ObjectId, annot_id: ObjectId) -> R
     match dict.get_deref(b"Type", doc) {
         Ok(obj) => {
             if obj.as_name()? != b"Annot".as_slice() {
-                return Err(Error::InvalidAnnotation);
+                return Err(Error::InvalidAnnotation.into());
             }
         }
         Err(lopdf::Error::DictKey) => (),
-        Err(e) => return Err(Error::Parsing(e)),
+        Err(e) => return Err(e.into()),
     };
 
     // /P is optional, but if present, it must point to the page where the
     // annotation is.
     if let Ok(p) = dict.get_deref(b"P", doc) {
         if p.as_reference()? != page_id {
-            return Err(Error::InvalidAnnotation);
+            return Err(Error::InvalidAnnotation.into());
         }
     }
 
     // /Subtype /Widget is mandatory.
     if dict.get_deref(b"Subtype", doc)?.as_name()? != b"Widget".as_slice() {
-        return Err(Error::InvalidAnnotation);
+        return Err(Error::InvalidAnnotation.into());
     }
 
     // /Rect is also mandatory.
