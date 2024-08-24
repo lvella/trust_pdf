@@ -140,4 +140,9 @@ mod tests {
     fn test_invalid_pdfs() {
         todo!()
     }
+
+    #[test]
+    fn test_split_interface() {
+        todo!()
+    }
 }
