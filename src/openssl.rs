@@ -57,7 +57,7 @@ impl super::Pkcs7Verifier for &OpenSslVerifier {
 }
 
 /// Loads a CA bundle from a directory containing PEM files.
-pub fn load_ca_bundle_from_dir(dir: &Path) -> Result<X509Store, anyhow::Error> {
+pub fn load_ca_bundle_from_dir(dir: &Path) -> Result<X509StoreBuilder, anyhow::Error> {
     let mut builder = X509StoreBuilder::new()?;
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
@@ -66,41 +66,74 @@ pub fn load_ca_bundle_from_dir(dir: &Path) -> Result<X509Store, anyhow::Error> {
         builder.add_cert(cert)?;
     }
 
-    Ok(builder.build())
+    Ok(builder)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path};
-
-    use openssl::stack::Stack;
+    use crate::SignatureInfo;
 
     use super::OpenSslVerifier;
+
+    use openssl::{pkcs7::Pkcs7, stack::Stack};
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+    };
 
     fn create_signature_verifier() -> OpenSslVerifier {
         let certs_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("test_data/trusted_CAs");
 
-        let ca_store = super::load_ca_bundle_from_dir(&certs_dir).unwrap();
+        // Stop verification at the first trusted certificate
+        let mut builder = super::load_ca_bundle_from_dir(&certs_dir).unwrap();
+        builder
+            .set_flags(openssl::x509::verify::X509VerifyFlags::PARTIAL_CHAIN)
+            .unwrap();
+        let ca_store = builder.build();
+
         let intermediaries = Stack::new().unwrap();
         OpenSslVerifier::new(ca_store, intermediaries)
+    }
+
+    fn verify(
+        verifier: &OpenSslVerifier,
+        reference: &[u8],
+        pdf_file_name: PathBuf,
+    ) -> Vec<SignatureInfo<Pkcs7>> {
+        let signed = fs::read(pdf_file_name).unwrap();
+        let result = crate::verify_from_reference(reference, signed, verifier).unwrap();
+        for res in &result {
+            if let Some(annot) = res.annotation.as_ref() {
+                assert_eq!(annot.page_idx, 0);
+                println!("Signature box {:?}", annot.rect);
+            }
+        }
+        result
     }
 
     #[test]
     fn test_valid_pdfs() {
         let verifier = create_signature_verifier();
         let pdfs_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("test_data/valid_modification");
-
         let unsigned = fs::read(pdfs_dir.join("unsigned.pdf")).unwrap();
 
-        // Test visible signature
-        {
-            let signed_visible = fs::read(pdfs_dir.join("signed-visible.pdf")).unwrap();
-            let result = crate::verify_from_reference(unsigned, signed_visible, &verifier).unwrap();
-            assert_eq!(result.len(), 1);
-            let annot = result[0].annotation.as_ref().unwrap();
-            assert_eq!(annot.page_idx, 0);
-            println!("Annotation box {:?}", annot.rect);
+        let result = verify(&verifier, &unsigned, pdfs_dir.join("signed-visible.pdf"));
+        assert_eq!(result.len(), 1);
+        assert!(result[0].annotation.is_some());
+
+        let result = verify(
+            &verifier,
+            &unsigned,
+            pdfs_dir.join("signed-visible-twice.pdf"),
+        );
+        assert_eq!(result.len(), 2);
+        for res in &result {
+            assert!(res.annotation.is_some());
         }
+
+        let result = verify(&verifier, &unsigned, pdfs_dir.join("signed-invisible.pdf"));
+        assert_eq!(result.len(), 1);
+        assert!(result[0].annotation.is_none());
     }
 
     #[test]

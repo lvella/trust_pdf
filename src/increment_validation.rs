@@ -28,6 +28,8 @@ pub enum Error {
     InvalidForm,
     #[error("signature dictionary was modified")]
     SignatureModified,
+    #[error("wrong SigFlags value")]
+    WrongSigFlags,
     #[error("mismatch between xref tables")]
     XrefMismatch,
 }
@@ -253,7 +255,8 @@ fn verify_acro_forms(
 
     let mut prev_fields = None;
 
-    let mut allowed_len = if let Some(prev_acro_form) = prev_acro_form {
+    let mut expected_len = if let Some(prev_acro_form) = prev_acro_form {
+        let mut extra_fields = 1;
         for (key, obj) in prev_acro_form.dict.iter() {
             if key == b"Fields" {
                 // Fields are handled separately.
@@ -265,6 +268,11 @@ fn verify_acro_forms(
                 prev_has_da = true;
             } else if key == b"DR" {
                 prev_has_dr = true;
+            } else if key == b"SigFlags" {
+                // We required SigFlags for the incremental update, but the
+                // original document may not have it. If it does, we don't need
+                // to count it as an extra field.
+                extra_fields = 0;
             }
 
             let curr_obj = curr_acro_form.get(key)?;
@@ -272,14 +280,15 @@ fn verify_acro_forms(
                 return Err(Error::AcroFormMismatch.into());
             }
         }
-        prev_acro_form.dict.len()
+        prev_acro_form.dict.len() + extra_fields
     } else {
-        1
+        // /Fields and /SigFlags are required in the increment.
+        2
     };
 
     let mut handle_extra_field = |key| {
         if curr_acro_form.has(key) {
-            allowed_len += 1;
+            expected_len += 1;
         }
     };
 
@@ -291,8 +300,13 @@ fn verify_acro_forms(
         handle_extra_field(b"DR");
     }
 
-    if curr_acro_form.len() != allowed_len {
+    if curr_acro_form.len() != expected_len {
         return Err(Error::AcroFormMismatch.into());
+    }
+
+    // Test /SigFlags expected value.
+    if curr_acro_form.get(b"SigFlags")?.as_i64()? != 3 {
+        return Err(Error::WrongSigFlags.into());
     }
 
     // Handle the fields
@@ -441,14 +455,16 @@ fn verify_page(
     curr_page: &Dictionary,
     prev_page: DictTracker,
 ) -> Result<[f32; 4]> {
-    let mut extra_annotation = None;
+    let mut prev_annots = None;
+    let mut extra_len = 1;
 
     for (key, obj) in prev_page.dict.iter() {
         if key == b"Annots" {
-            let curr_annots = curr_page.get_deref(b"Annots", curr_doc)?.as_array()?;
-            let prev_annots = prev_page.tracker.deref(obj)?.as_array()?;
+            prev_annots = Some(prev_page.tracker.deref(obj)?.as_array()?);
+            extra_len = 0;
 
-            extra_annotation = Some(has_array_one_extra_ref(curr_annots, Some(prev_annots))?);
+            // Annotations are handled separately.
+            continue;
         }
 
         let curr_obj = curr_page.get(key)?;
@@ -457,13 +473,14 @@ fn verify_page(
         }
     }
 
-    if curr_page.len() != prev_page.dict.len() {
+    if curr_page.len() != prev_page.dict.len() + extra_len {
         return Err(Error::PageMismatch.into());
     }
 
-    extra_annotation
-        .ok_or(lopdf::Error::DictKey.into())
-        .and_then(|annot_id| verify_annotation(curr_doc, curr_page_id, annot_id))
+    let curr_annots = curr_page.get_deref(b"Annots", curr_doc)?.as_array()?;
+    let extra_annotation = has_array_one_extra_ref(curr_annots, prev_annots)?;
+
+    verify_annotation(curr_doc, curr_page_id, extra_annotation)
 }
 
 /// Some signing software creates an annotation /Widget with the "visuals" of
@@ -486,7 +503,7 @@ fn verify_annotation(doc: &Document, page_id: ObjectId, annot_id: ObjectId) -> R
 
     // /P is optional, but if present, it must point to the page where the
     // annotation is.
-    if let Ok(p) = dict.get_deref(b"P", doc) {
+    if let Ok(p) = dict.get(b"P") {
         if p.as_reference()? != page_id {
             return Err(Error::InvalidAnnotation.into());
         }

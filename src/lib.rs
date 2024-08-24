@@ -177,9 +177,6 @@ fn verify_impl<'a>(
     // Ensures that the incremental updates were added correctly.
     let mut annotations = Vec::new();
     {
-        const SIZE: usize = std::mem::size_of::<Document>();
-        println!("SIZE: {}", SIZE);
-
         let mut tmp_storage;
         let mut curr_doc = doc;
         for (sig, previous_doc) in added_signatures.iter().zip(incremental_updates) {
