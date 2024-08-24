@@ -40,6 +40,7 @@ pub trait Pkcs7Verifier {
     fn verify(&self, pkcs7_der: &[u8], signed_data: [&[u8]; 2]) -> Result<Self::Return>;
 }
 
+#[derive(Debug)]
 pub struct SignatureInfo<T> {
     pub annotation: Option<Annotation>,
     pub signed_byte_ranges: [Range<usize>; 2],

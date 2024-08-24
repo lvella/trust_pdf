@@ -16,7 +16,7 @@ pub enum Error {
     WrongDistinguished,
 }
 
-/// Verifies the signatures using OpenSSL.
+/// OpenSSL implementation of the signature verifier.
 pub struct OpenSslVerifier {
     ca_store: X509Store,
     intermediaries: Stack<X509>,
@@ -138,11 +138,35 @@ mod tests {
 
     #[test]
     fn test_invalid_pdfs() {
-        todo!()
+        let verifier = create_signature_verifier();
+        let pdfs_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("test_data/invalid_modification");
+        let unsigned = fs::read(pdfs_dir.join("unsigned.pdf")).unwrap();
+
+        let result = verify(&verifier, &unsigned, pdfs_dir.join("valid_signed.pdf"));
+        assert_eq!(result.len(), 1);
+        assert!(result[0].annotation.is_some());
+
+        let invalid = fs::read(pdfs_dir.join("invalid_signed.pdf")).unwrap();
+        let err = crate::verify_from_reference(unsigned, invalid, &verifier)
+            .err()
+            .unwrap();
+        println!("Failure reason: {err}");
     }
 
     #[test]
     fn test_split_interface() {
-        todo!()
+        let verifier = create_signature_verifier();
+        let pdfs_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("test_data/invalid_modification");
+
+        // Get the byte length of the unsigned PDF
+        let unsigned_len = fs::metadata(pdfs_dir.join("unsigned.pdf")).unwrap().len() as usize;
+        let signed = fs::read(pdfs_dir.join("valid_signed.pdf")).unwrap();
+
+        crate::verify_incremental_update(
+            &signed[..unsigned_len],
+            &signed[unsigned_len..],
+            &verifier,
+        )
+        .unwrap();
     }
 }

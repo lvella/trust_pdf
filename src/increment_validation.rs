@@ -148,6 +148,7 @@ impl PartialEq for XrefEntryComparer<'_> {
     }
 }
 
+#[derive(Debug)]
 pub struct Annotation {
     pub page_idx: usize,
     pub rect: [f32; 4],
