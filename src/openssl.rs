@@ -150,7 +150,7 @@ mod tests {
         let err = crate::verify_from_reference(unsigned, invalid, &verifier)
             .err()
             .unwrap();
-        println!("Failure reason: {err}");
+        println!("Difference detected: {err}");
     }
 
     #[test]

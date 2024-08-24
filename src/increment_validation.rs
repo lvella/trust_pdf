@@ -16,7 +16,7 @@ pub enum Error {
     CatalogMismatch,
     #[error("mismatch between /AcroForm dictionaries")]
     AcroFormMismatch,
-    #[error("array has more than one extra reference")]
+    #[error("array does not have exactly one extra reference")]
     NotSingleArrayIncrement,
     #[error("multiple pages changed in the increment")]
     MultiplePagesChanged,
