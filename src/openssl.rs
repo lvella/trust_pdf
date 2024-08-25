@@ -57,7 +57,7 @@ impl super::Pkcs7Verifier for &OpenSslVerifier {
 }
 
 /// Loads a CA bundle from a directory containing PEM files.
-pub fn load_ca_bundle_from_dir(dir: &Path) -> Result<X509StoreBuilder, anyhow::Error> {
+pub fn load_ca_bundle_from_dir<P: AsRef<Path>>(dir: P) -> Result<X509StoreBuilder, anyhow::Error> {
     let mut builder = X509StoreBuilder::new()?;
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
@@ -85,7 +85,7 @@ mod tests {
         let certs_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("test_data/trusted_CAs");
 
         // Stop verification at the first trusted certificate
-        let mut builder = super::load_ca_bundle_from_dir(&certs_dir).unwrap();
+        let mut builder = super::load_ca_bundle_from_dir(certs_dir).unwrap();
         builder
             .set_flags(openssl::x509::verify::X509VerifyFlags::PARTIAL_CHAIN)
             .unwrap();

@@ -92,3 +92,65 @@ crafted and placed somewhere to meaningfully change the interpretation of the
 contents. To mitigate that, this library will also return the page and the
 rectangle of each signature annotation, for further whitelisting by the
 application.
+
+## Usage
+
+Below is a minimal complete program on how to verify one signed PDF file against
+an unsigned reference.
+
+```rust
+// Load the PDF files
+let reference_file_i_wrote_and_trust =
+    std::fs::read("test_data/valid_modification/unsigned.pdf").unwrap();
+let signed_file_i_received =
+    std::fs::read("test_data/valid_modification/signed-visible.pdf").unwrap();
+
+// Create the OpenSSL verifier
+let trust_store = trust_pdf::openssl::load_ca_bundle_from_dir("test_data/trusted_CAs")
+    .unwrap()
+    .build();
+let intermediaries = openssl::stack::Stack::new().unwrap();
+let digital_signature_verifier =
+    trust_pdf::openssl::OpenSslVerifier::new(trust_store, intermediaries);
+
+// Verify the signed file with the original as reference
+if trust_pdf::verify_from_reference(
+    reference_file_i_wrote_and_trust,
+    signed_file_i_received,
+    &digital_signature_verifier,
+)
+.is_ok()
+{
+    println!("Everything looks alright!");
+} else {
+    println!("Someone is trying to trick you!");
+}
+```
+
+## Optional Features
+
+* `openssl`: this feature uses the `openssl` crate to provide an implementation
+  for the `Pkcs7Verifier` trait, needed to verify PKCS #7 signatures embedded in
+  the PDF files. You can however provide your own implementation, so dependency
+  on OpenSSL is optional.
+
+## Security
+
+This library is a best effort attempt, and as it stands, was written by one guy
+during his holidays and spare time, and underwent no independend review, no real
+world usage, and barely any testing. Also be mindful of the no-warranty clause
+in the license.
+
+That said, if you really want to secure anything with it, then I suggest, as a
+backup plan, putting legal language in you unsigned document saying that any
+digital signature in the document applies only to the first, unmodified version,
+of the PDF document, and modifications introduced via Incremental Updates are
+not legally binding. Assess with your lawyier the chances of such a thing
+holding up in court.
+
+Finally, in the off-chance anyone is interested in funding it, this project
+would benefit from a professional security audit and a bug bounty program.
+
+# License
+
+This project is distributed under MIT license.
