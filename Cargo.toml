@@ -2,6 +2,11 @@
 name = "trust_pdf"
 version = "0.1.0"
 edition = "2021"
+authors = ["Lucas Clemente Vella <lvella@gmail.com>"]
+description = "Verifies signed PDFs against the originals, checking for sneaky modifications and validating signatures."
+license = "MIT"
+repository = "https://github.com/lvella/trust_pdf"
+readme = "README.md"
 
 [dependencies]
 anyhow = "1.0"
