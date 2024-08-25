@@ -84,7 +84,8 @@ signatures in the document:
   added;
 * The signatures must be valid, and cover from the beginning of the document to
   the end of their incremental update;
-* The final signature must cover the entire document.
+* The final signature must cover the entire document;
+* And probably some more restrictions.
 
 It is my hope that this will suffice to prevent any content modification of the
 rendered PDF, with the exception of the signature annotation, which might be

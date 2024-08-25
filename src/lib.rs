@@ -8,7 +8,7 @@ mod increment_validation;
 use std::ops::Range;
 
 use anyhow::Result;
-use increment_validation::Annotation;
+pub use increment_validation::Annotation;
 use lopdf::{xref::XrefEntry, Dictionary, Document, Object, ObjectId};
 use regex::bytes::Regex;
 use thiserror::Error;
@@ -37,21 +37,53 @@ pub enum Error {
     InternalConsistency,
 }
 
+/// Verifies the signatures in DER encoded PKCS #7 archive.
+///
+/// This is used to verify the cryptographic signatures inside a PDF document.
 pub trait Pkcs7Verifier {
+    /// The return type of the verification function upon success.
+    ///
+    /// The return values for each signature are collected in the final result.
     type Return;
+
+    /// Verifies a PKCS #7 signature, and returns an implementation defined
+    /// result on success.
+    ///
+    /// The `pkcs7_der` parameter is the DER encoded PKCS #7 signature.
+    ///
+    /// The `signed_data` is the acutal signed data, split in two slices. They
+    /// are split due to the way PDF signatures work, but they must be chained
+    /// together to make up the full signed data.
     fn verify(&self, pkcs7_der: &[u8], signed_data: [&[u8]; 2]) -> Result<Self::Return>;
 }
 
+/// Information about a verified signature in a PDF document.
 #[derive(Debug)]
 pub struct SignatureInfo<T> {
+    /// If the signature corresponds to a visible annotation, this field holds
+    /// the details about it.
     pub annotation: Option<Annotation>,
+
+    /// The byte ranges of the document that were signed. The skipped range
+    /// contains the signature itself.
     pub signed_byte_ranges: [Range<usize>; 2],
+
+    /// The result of the signature verification, determined by the verifier.
     pub signature_verifier_result: T,
 }
 
-/// Verifies the signatures in a PDF document, assembled by concatenating an
-/// incremental update to the reference document. Ensures that the contents of
-/// the final document matches the reference.
+/// Verifies a reference document appended with an incremental update results in
+/// a signed PDF with unchanged content.
+///
+/// The `reference_pdf_bytes` parameter is the reference document, and the
+/// `incremental_update_bytes` parameter is the incremental update to be
+/// appended to the reference document.
+///
+/// The idea of this function is that if there is a single reference document
+/// that has to be signed independently by multiple people, to save space you
+/// may want to avoid storing the reference document multiple times. Instead,
+/// you can store the reference document once and then store the incremental
+/// updates separately.
 pub fn verify_incremental_update<V: Pkcs7Verifier>(
     reference_pdf_bytes: impl AsRef<[u8]>,
     incremental_update_bytes: impl AsRef<[u8]>,
@@ -69,8 +101,12 @@ pub fn verify_incremental_update<V: Pkcs7Verifier>(
     verify(&full_pdf, end_of_reference_pdf, signature_verifier)
 }
 
-/// Verifies the signatures in a PDF document, ensuring that the contents of the
-/// document matches the reference document.
+/// Verifies that the contents of a signed PDF matches a reference document.
+///
+/// The `reference_pdf_bytes` parameter is the reference document, and the
+/// `signed_pdf_bytes` parameter is the signed document.
+///
+/// The `signature_verifier` parameter is used to verify the PKCS #7 signatures.
 pub fn verify_from_reference<V: Pkcs7Verifier>(
     reference_pdf_bytes: impl AsRef<[u8]>,
     signed_pdf_bytes: impl AsRef<[u8]>,
@@ -88,8 +124,12 @@ pub fn verify_from_reference<V: Pkcs7Verifier>(
     verify(signed, end_of_reference_pdf, signature_verifier)
 }
 
-/// Verifies the signatures in a PDF document, ensuring that the contents of the
-/// document matches a previous increment of the same document.
+/// Verifies that the contents of a signed PDF file matches an earlier version.
+///
+/// The `pdf_bytes` parameter is the signed document, and the `end_of_reference_pdf`
+/// is the byte offset inside the same file where the reference document ends.
+///
+/// The `signature_verifier` parameter is used to verify the PKCS #7 signatures.
 pub fn verify<V: Pkcs7Verifier>(
     pdf_bytes: &[u8],
     end_of_reference_pdf: usize,

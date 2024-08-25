@@ -1,3 +1,8 @@
+//! Optional OpenSSL module for signature verification.
+//!
+//! This module provides an OpneSSL-based implementation of the signature
+//! verifier. See [`OpenSslVerifier`]. It is enabled by the `openssl` feature.
+
 use std::path::Path;
 
 use openssl::pkcs7::{Pkcs7, Pkcs7Flags};
@@ -6,15 +11,6 @@ use openssl::x509::{
     store::{X509Store, X509StoreBuilder},
     X509,
 };
-use thiserror::Error;
-
-#[derive(Error, Debug)]
-pub enum Error {
-    #[error("openssl error")]
-    OpenSSLError(#[from] openssl::error::ErrorStack),
-    #[error("unexpected distinguished name format")]
-    WrongDistinguished,
-}
 
 /// OpenSSL implementation of the signature verifier.
 pub struct OpenSslVerifier {
@@ -34,8 +30,13 @@ impl OpenSslVerifier {
 }
 
 impl super::Pkcs7Verifier for &OpenSslVerifier {
+    /// Uses `openssl` crate [`Pkcs7`] structure as the returned value.
+    ///
+    /// It contains all the information about the signature, including the
+    /// signer's certificate and identity.
     type Return = Pkcs7;
 
+    /// Verifies a PKCS #7 signature using OpenSSL.
     fn verify(&self, pkcs7_der: &[u8], signed_data: [&[u8]; 2]) -> anyhow::Result<Self::Return> {
         // Unfortunately OpenSSL requires a contiguous array of bytes to verify
         // the signature, so we must allocate and copy the slices.
@@ -56,7 +57,7 @@ impl super::Pkcs7Verifier for &OpenSslVerifier {
     }
 }
 
-/// Loads a CA bundle from a directory containing PEM files.
+/// Loads CA certificates from a directory containing PEM files.
 pub fn load_ca_bundle_from_dir<P: AsRef<Path>>(dir: P) -> Result<X509StoreBuilder, anyhow::Error> {
     let mut builder = X509StoreBuilder::new()?;
     for entry in std::fs::read_dir(dir)? {

@@ -148,9 +148,18 @@ impl PartialEq for XrefEntryComparer<'_> {
     }
 }
 
+/// Information about a visible signature annotation.
 #[derive(Debug)]
 pub struct Annotation {
+    /// The index of the page where the annotation is located, starting from 0.
     pub page_idx: usize,
+
+    /// The rectangle where the annotation is located.
+    ///
+    /// The values are `[x1, y1, x2, y2]`, where `(x1, y1)` is the bottom-left
+    /// corner and `(x2, y2)` is the top-right corner. The PDF coordinate system
+    /// has the origin at the bottom-left corner of the page, and the unit is
+    /// point (1/72 of an inch).
     pub rect: [f32; 4],
 }
 
