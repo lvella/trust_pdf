@@ -102,7 +102,7 @@ mod tests {
         pdf_file_name: PathBuf,
     ) -> Vec<SignatureInfo<Pkcs7>> {
         let signed = fs::read(pdf_file_name).unwrap();
-        let result = crate::verify_from_reference(reference, signed, verifier).unwrap();
+        let result = crate::verify_from_reference(reference, signed, verifier, true).unwrap();
         for res in &result {
             if let Some(annot) = res.annotation.as_ref() {
                 assert_eq!(annot.page_idx, 0);
@@ -148,26 +148,9 @@ mod tests {
         assert!(result[0].annotation.is_some());
 
         let invalid = fs::read(pdfs_dir.join("invalid_signed.pdf")).unwrap();
-        let err = crate::verify_from_reference(unsigned, invalid, &verifier)
+        let err = crate::verify_from_reference(unsigned, invalid, &verifier, true)
             .err()
             .unwrap();
         println!("Difference detected: {err}");
-    }
-
-    #[test]
-    fn test_split_interface() {
-        let verifier = create_signature_verifier();
-        let pdfs_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("test_data/invalid_modification");
-
-        // Get the byte length of the unsigned PDF
-        let unsigned_len = fs::metadata(pdfs_dir.join("unsigned.pdf")).unwrap().len() as usize;
-        let signed = fs::read(pdfs_dir.join("valid_signed.pdf")).unwrap();
-
-        crate::verify_incremental_update(
-            &signed[..unsigned_len],
-            &signed[unsigned_len..],
-            &verifier,
-        )
-        .unwrap();
     }
 }

@@ -119,6 +119,7 @@ if trust_pdf::verify_from_reference(
     reference_file_i_wrote_and_trust,
     signed_file_i_received,
     &digital_signature_verifier,
+    true
 )
 .is_ok()
 {
