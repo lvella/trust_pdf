@@ -29,22 +29,20 @@ impl OpenSslVerifier {
     }
 }
 
-impl super::Pkcs7Verifier for &OpenSslVerifier {
-    /// Uses `openssl` crate [`Pkcs7`] structure as the returned value.
-    ///
-    /// It contains all the information about the signature, including the
-    /// signer's certificate and identity.
-    type Return = Pkcs7;
-
+impl OpenSslVerifier {
     /// Verifies a PKCS #7 signature using OpenSSL.
-    fn verify(&self, pkcs7_der: &[u8], signed_data: [&[u8]; 2]) -> anyhow::Result<Self::Return> {
+    ///
+    /// Returns the parsed PKCS #7 structure if the signature is valid, which
+    /// contains the signers certificates and other information that might be
+    /// of interest.
+    pub fn verify(&self, pkcs7_ber: &[u8], signed_data: [&[u8]; 2]) -> anyhow::Result<Pkcs7> {
         // Unfortunately OpenSSL requires a contiguous array of bytes to verify
         // the signature, so we must allocate and copy the slices.
         let mut contiguous = Vec::with_capacity(signed_data[0].len() + signed_data[1].len());
         contiguous.extend_from_slice(signed_data[0]);
         contiguous.extend_from_slice(signed_data[1]);
 
-        let pkcs7 = Pkcs7::from_der(pkcs7_der)?;
+        let pkcs7 = Pkcs7::from_der(pkcs7_ber)?;
         pkcs7.verify(
             &self.intermediaries,
             &self.ca_store,
@@ -54,6 +52,21 @@ impl super::Pkcs7Verifier for &OpenSslVerifier {
         )?;
 
         Ok(pkcs7)
+    }
+
+    /// Verifies multiple signatures from a validated PDF file.
+    pub fn verify_many(
+        &self,
+        full_pdf: &[u8],
+        signatures: &[crate::SignatureInfo],
+    ) -> anyhow::Result<Vec<Pkcs7>> {
+        signatures
+            .iter()
+            .map(|sig| {
+                let signed_slices = sig.signed_byte_ranges.clone().map(|r| &full_pdf[r]);
+                self.verify(&sig.pkcs7_ber, signed_slices)
+            })
+            .collect()
     }
 }
 
@@ -76,7 +89,7 @@ mod tests {
 
     use super::OpenSslVerifier;
 
-    use openssl::{pkcs7::Pkcs7, stack::Stack};
+    use openssl::stack::Stack;
     use std::{
         fs,
         path::{Path, PathBuf},
@@ -100,9 +113,10 @@ mod tests {
         verifier: &OpenSslVerifier,
         reference: &[u8],
         pdf_file_name: PathBuf,
-    ) -> Vec<SignatureInfo<Pkcs7>> {
+    ) -> Vec<SignatureInfo> {
         let signed = fs::read(pdf_file_name).unwrap();
-        let result = crate::verify_from_reference(reference, signed, verifier, true).unwrap();
+        let result = crate::verify_from_reference(reference, &signed).unwrap();
+        verifier.verify_many(&signed, &result).unwrap();
         for res in &result {
             if let Some(annot) = res.annotation.as_ref() {
                 assert_eq!(annot.page_idx, 0);
@@ -148,7 +162,7 @@ mod tests {
         assert!(result[0].annotation.is_some());
 
         let invalid = fs::read(pdfs_dir.join("invalid_signed.pdf")).unwrap();
-        let err = crate::verify_from_reference(unsigned, invalid, &verifier, true)
+        let err = crate::verify_from_reference(unsigned, invalid)
             .err()
             .unwrap();
         println!("Difference detected: {err}");

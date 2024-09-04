@@ -1,6 +1,6 @@
 [package]
 name = "trust_pdf"
-version = "1.0.0"
+version = "2.0.0"
 edition = "2021"
 authors = ["Lucas Clemente Vella <lvella@gmail.com>"]
 description = "Verifies signed PDFs against the originals, checking for sneaky modifications and validating signatures."

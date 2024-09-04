@@ -37,57 +37,33 @@ pub enum Error {
     InternalConsistency,
 }
 
-/// Verifies the signatures in DER encoded PKCS #7 archive.
+/// Information about a signature found in the PDF document.
 ///
-/// This is used to verify the cryptographic signatures inside a PDF document.
-pub trait Pkcs7Verifier {
-    /// The return type of the verification function upon success.
-    ///
-    /// The return values for each signature are collected in the final result.
-    type Return;
-
-    /// Verifies a PKCS #7 signature, and returns an implementation defined
-    /// result on success.
-    ///
-    /// The `pkcs7_der` parameter is the DER encoded PKCS #7 signature.
-    ///
-    /// The `signed_data` is the acutal signed data, split in two slices. They
-    /// are split due to the way PDF signatures work, but they must be chained
-    /// together to make up the full signed data.
-    fn verify(&self, pkcs7_der: &[u8], signed_data: [&[u8]; 2]) -> Result<Self::Return>;
-}
-
-/// Information about a verified signature in a PDF document.
+/// The signatures have not been verified yet. You can use the optional
+/// [`openssl`] module to verify them.
 #[derive(Debug)]
-pub struct SignatureInfo<T> {
+pub struct SignatureInfo {
     /// If the signature corresponds to a visible annotation, this field holds
     /// the details about it.
     pub annotation: Option<Annotation>,
 
     /// The byte ranges of the document that were signed. The skipped range
-    /// contains the signature itself.
+    /// contains the signature itself, as an hexadecimal encoded PDF ByteStream.
     pub signed_byte_ranges: [Range<usize>; 2],
 
-    /// The result of the signature verification, determined by the verifier.
-    pub signature_verifier_result: T,
+    /// The signature itself, as decoded from the PDF ByteStream. It is a BER
+    /// encoded PKCS #7.
+    pub pkcs7_ber: Vec<u8>,
 }
 
 /// Verifies if the contents of a signed PDF matches a reference document.
 ///
 /// The `reference_pdf_bytes` parameter is the reference document, and the
 /// `signed_pdf_bytes` parameter is the signed document.
-///
-/// The `signature_verifier` parameter is used to verify the PKCS #7 signatures.
-///
-/// Parameter `skip_old_signatures` tells wether to skip the verification of
-/// the signatures in the original document (in case they are already
-/// trusted).
-pub fn verify_from_reference<V: Pkcs7Verifier>(
+pub fn verify_from_reference(
     reference_pdf_bytes: impl AsRef<[u8]>,
     signed_pdf_bytes: impl AsRef<[u8]>,
-    signature_verifier: V,
-    skip_old_signatures: bool,
-) -> Result<Vec<SignatureInfo<V::Return>>> {
+) -> Result<Vec<SignatureInfo>> {
     let signed = signed_pdf_bytes.as_ref();
     let reference = reference_pdf_bytes.as_ref();
 
@@ -97,11 +73,7 @@ pub fn verify_from_reference<V: Pkcs7Verifier>(
     let end_of_reference_pdf = reference.len();
     drop(reference_pdf_bytes);
 
-    Verifier::parse(signed)?.verify(
-        end_of_reference_pdf,
-        signature_verifier,
-        skip_old_signatures,
-    )
+    Verifier::parse(signed)?.verify(end_of_reference_pdf)
 }
 
 /// State machine for parsing and then verifying.
@@ -126,51 +98,11 @@ impl<'a> Verifier<'a> {
     /// PDF document inside the full signed document, to be compared against.
     /// The contents of the original document must match the contents of the
     /// signed document.
-    ///
-    /// The `signature_verifier` parameter contains PKCS #7 signature verifyer
-    /// to be used.
-    ///
-    /// Parameter `skip_old_signatures` tells wether to skip the verification of
-    /// the signatures in the original document (in case they are already
-    /// trusted).
-    pub fn verify<V: Pkcs7Verifier>(
-        &self,
-        end_of_reference_pdf: usize,
-        signature_verifier: V,
-        skip_old_signatures: bool,
-    ) -> Result<Vec<SignatureInfo<V::Return>>> {
-        basic_file_buff_checks(self.pdf_bytes, end_of_reference_pdf)?;
-        let signatures = self.verify_impl(end_of_reference_pdf, skip_old_signatures)?;
-
-        let mut result = Vec::new();
-
-        // Finally, we verify the signatures.
-        for (annotation, sig) in signatures {
-            let signed_byte_ranges = [
-                0..sig.skipped_range.start,
-                sig.skipped_range.end..sig.coverage_end as usize,
-            ];
-
-            let signed_slices = signed_byte_ranges.clone().map(|r| &self.pdf_bytes[r]);
-
-            result.push(SignatureInfo {
-                annotation,
-                signed_byte_ranges,
-                signature_verifier_result: signature_verifier
-                    .verify(sig.pkcs7_der, signed_slices)?,
-            });
-        }
-
-        Ok(result)
-    }
-
-    fn verify_impl(
-        &'a self,
-        end_of_reference_pdf: usize,
-        skip_old_signatures: bool,
-    ) -> Result<Vec<(Option<Annotation>, Signature<'a>)>> {
+    pub fn verify(&self, end_of_reference_pdf: usize) -> Result<Vec<SignatureInfo>> {
         let doc = &self.doc;
         let pdf_bytes = self.pdf_bytes;
+
+        basic_file_buff_checks(pdf_bytes, end_of_reference_pdf)?;
 
         if end_of_reference_pdf == pdf_bytes.len() {
             return Ok(Vec::new());
@@ -234,19 +166,27 @@ impl<'a> Verifier<'a> {
         }
 
         // Join annotations with the signatures in a single vector.
-
-        Ok(if skip_old_signatures {
-            signatures.truncate(partition_point);
-            annotations.into_iter().zip(signatures).collect()
-        } else {
-            // Since annotations may be smaller than the signatures, we must pad the
-            // the beginning of the vector with None.
-            let extra_none_count = signatures.len() - annotations.len();
-            let padded_annotations = std::iter::repeat_with(|| None)
-                .take(extra_none_count)
-                .chain(annotations);
-            padded_annotations.zip(signatures).collect()
-        })
+        //
+        // Since annotations may be smaller than the signatures, we must pad the
+        // the beginning of the vector with None.
+        let extra_none_count = signatures.len() - annotations.len();
+        let padded_annotations = std::iter::repeat_with(|| None)
+            .take(extra_none_count)
+            .chain(annotations);
+        padded_annotations
+            .zip(signatures)
+            .map(|(annotation, signature)| {
+                let signed_byte_ranges = [
+                    0..signature.skipped_range.start,
+                    signature.skipped_range.end..signature.coverage_end as usize,
+                ];
+                Ok(SignatureInfo {
+                    annotation,
+                    signed_byte_ranges,
+                    pkcs7_ber: signature.pkcs7_ber,
+                })
+            })
+            .collect()
     }
 }
 
@@ -273,19 +213,19 @@ impl<T, const N: usize> FromIterator<T> for ExactArrayOrNone<T, N> {
     }
 }
 
-struct Signature<'a> {
+struct Signature {
     obj_id: ObjectId,
     offset: u32,
     coverage_end: i64,
     skipped_range: Range<usize>,
-    pkcs7_der: &'a [u8],
+    pkcs7_ber: Vec<u8>,
 }
 
-fn get_signature_objects<'a>(
+fn get_signature_objects(
     pdf_bytes: &[u8],
-    doc: &'a Document,
-    acro_form: &'a Dictionary,
-) -> Result<Vec<Signature<'a>>> {
+    doc: &Document,
+    acro_form: &Dictionary,
+) -> Result<Vec<Signature>> {
     let mut signatures = Vec::new();
 
     for field in acro_form
@@ -307,11 +247,11 @@ fn get_signature_objects<'a>(
     Ok(signatures)
 }
 
-fn process_signature<'a>(
+fn process_signature(
     pdf_bytes: &[u8],
-    doc: &'a Document,
-    sig_reference: &'a Object,
-) -> Result<Signature<'a>> {
+    doc: &Document,
+    sig_reference: &Object,
+) -> Result<Signature> {
     let (Some(obj_id), Object::Dictionary(signature)) = doc.dereference(sig_reference)? else {
         // Signature object must be an indirect dictionary.
         return Err(Error::InvalidSignatureObject.into());
@@ -381,7 +321,7 @@ fn process_signature<'a>(
         offset,
         coverage_end: signed_range_end,
         skipped_range: signed_range[1] as usize..signed_range[2] as usize,
-        pkcs7_der: pkcs7_signature,
+        pkcs7_ber: skipped_bytes,
     })
 }
 
@@ -395,8 +335,9 @@ fn is_signature(annot_dict: &Dictionary) -> bool {
     false
 }
 
-/// Decodes a PDF hex string, skipping whitespace.
-/// Returns None if any character is not a valid hex digit.
+/// Decodes a PDF hex string, including the delimiters '<' and '>'.
+///
+/// Returns None if the string doesn't match the pattern "^<[0-9A-Fa-f]*>$".
 fn decode_pdf_hex_string(hex_input: &[u8]) -> Option<Vec<u8>> {
     // First and last characters must be the delimiters '<' and '>'.
     if hex_input.first() != Some(&b'<') || hex_input.last() != Some(&b'>') {
