@@ -119,12 +119,16 @@ let Ok(signatures) = result else {
 // The signed document is valid extension of the unsigned document,
 // but we still need to validate the signatures. If you enabled the
 // `openssl` feature, we have a helper function for that.
-let trust_store = trust_pdf::openssl::load_ca_bundle_from_dir("test_data/trusted_CAs")
-    .unwrap()
-    .build();
+let mut trust_store = trust_pdf::openssl::load_ca_bundle_from_dir("test_data/trusted_CAs")
+    .unwrap();
+trust_store
+    .set_flags(openssl::x509::verify::X509VerifyFlags::PARTIAL_CHAIN)
+    .unwrap();
+
 let intermediaries = openssl::stack::Stack::new().unwrap();
+
 let digital_signature_verifier =
-    trust_pdf::openssl::OpenSslVerifier::new(trust_store, intermediaries);
+    trust_pdf::openssl::OpenSslVerifier::new(trust_store.build(), intermediaries);
 if digital_signature_verifier.verify_many(&signed_file_i_received, &signatures).is_ok()
 {
     println!("Everything looks alright!");

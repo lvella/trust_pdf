@@ -86,7 +86,7 @@ impl<'a> DocTracker<'a> {
         let traversed = self.traversed.into_inner();
 
         for (id, entry) in self.doc.reference_table.entries.iter() {
-            if traversed.get(id).is_some() {
+            if traversed.contains_key(id) {
                 // This entry is allowed to be different.
                 continue;
             }

@@ -76,7 +76,7 @@ pub fn verify_from_reference(
     Verifier::parse(signed)?.verify(end_of_reference_pdf)
 }
 
-/// State machine for parsing and then verifying.
+/// A parsed PDF ready to be verified.
 pub struct Verifier<'a> {
     doc: Document,
     pdf_bytes: &'a [u8],
