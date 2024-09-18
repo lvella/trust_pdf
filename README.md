@@ -1,6 +1,6 @@
 # Trust PDF
 
-A library to verify that a signed PDF is valid, and matches the unsigned original.
+A library to verify that a signed PDF matches the unsigned original.
 
 ## The Problem
 
@@ -29,7 +29,7 @@ the process, you should be instead dealing with PKCS #7 files with the PDF
 embedded in them, and not the other way around (and if that was the case, the
 task would be indeed trivial).
 
-But in the real world, we have governments running online tools for generating
+But in the real world, we have governments running online tools to generate
 legally binding digital signatures for its citizens, where the only possible
 output is a signed PDF, who became the de-facto standard for digitally signed
 documents, and we have to find a way to automatically deal with them.
@@ -106,26 +106,30 @@ let reference_file_i_wrote_and_trust =
 let signed_file_i_received =
     std::fs::read("test_data/valid_modification/signed-visible.pdf").unwrap();
 
-// Create the OpenSSL verifier
+// Verify the signed file with the original as reference
+let result = trust_pdf::verify_from_reference(
+    reference_file_i_wrote_and_trust,
+    &signed_file_i_received,
+);
+
+let Ok(signatures) = result else {
+    panic!("Someone is trying to trick you!");
+};
+
+// The signed document is valid extension of the unsigned document,
+// but we still need to validate the signatures. If you enabled the
+// `openssl` feature, we have a helper function for that.
 let trust_store = trust_pdf::openssl::load_ca_bundle_from_dir("test_data/trusted_CAs")
     .unwrap()
     .build();
 let intermediaries = openssl::stack::Stack::new().unwrap();
 let digital_signature_verifier =
     trust_pdf::openssl::OpenSslVerifier::new(trust_store, intermediaries);
-
-// Verify the signed file with the original as reference
-if trust_pdf::verify_from_reference(
-    reference_file_i_wrote_and_trust,
-    signed_file_i_received,
-    &digital_signature_verifier,
-    true
-)
-.is_ok()
+if digital_signature_verifier.verify_many(&signed_file_i_received, &signatures).is_ok()
 {
     println!("Everything looks alright!");
 } else {
-    println!("Someone is trying to trick you!");
+    panic!("The digital signatures are invalid!");
 }
 ```
 
