@@ -3,11 +3,7 @@ use crate::ExactArrayOrNone;
 use super::Signature;
 use anyhow::Result;
 use lopdf::{xref::XrefEntry, Dictionary, Document, Object, ObjectId};
-use std::{
-    cell::RefCell,
-    collections::{HashMap, HashSet},
-    vec::IntoIter,
-};
+use std::{cell::RefCell, collections::HashMap, vec::IntoIter};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -361,13 +357,15 @@ impl<I> Peekable for IntoIter<I> {
 /// single exta element, and all elements in both arrays are references, returns
 /// the extra element.
 ///
-/// Allows for reordering.
+/// If all elements match, returns Ok(None).
 ///
 /// Returns or Err in any other case.
-fn has_array_one_extra_ref(
+///
+/// Allows for reordering.
+fn has_array_zero_or_one_extra_ref(
     curr_refs: &[Object],
     prev_refs: Option<&Vec<Object>>,
-) -> Result<ObjectId> {
+) -> Result<Option<ObjectId>> {
     fn sort_array(array: &[Object]) -> Result<IntoIter<ObjectId>> {
         let mut array = array
             .iter()
@@ -389,12 +387,20 @@ fn has_array_one_extra_ref(
         curr_iter.next();
     }
 
-    let odd_one_out = curr_iter.next().ok_or(Error::NotSingleArrayIncrement)?;
+    let odd_one_out = curr_iter.next();
     if !curr_iter.eq(prev_iter) {
         return Err(Error::NotSingleArrayIncrement.into());
     }
 
     Ok(odd_one_out)
+}
+
+fn has_array_one_extra_ref(
+    curr_refs: &[Object],
+    prev_refs: Option<&Vec<Object>>,
+) -> Result<ObjectId> {
+    has_array_zero_or_one_extra_ref(curr_refs, prev_refs)?
+        .ok_or(Error::NotSingleArrayIncrement.into())
 }
 
 fn verify_pages(
@@ -406,19 +412,19 @@ fn verify_pages(
 
     let kids = pages.get_deref(b"Kids", curr_doc)?.as_array()?;
     for (page_idx, page) in kids.iter().enumerate() {
-        if let Some(page_id) = object_has_changed(curr_doc, prev_doc.doc, page.as_reference()?)? {
-            // Found our candidate page to contain the signature annotation.
+        // We check every page for exactly one extra annotation.
+        let curr_page = curr_doc.get_dictionary(page.as_reference()?)?;
+        let prev_page = prev_doc.deref_dict(page)?;
+
+        if let Some(rect_found) = verify_page(curr_doc, page.as_reference()?, curr_page, prev_page)?
+        {
             if extra_annotation.is_some() {
                 return Err(Error::MultiplePagesChanged.into());
             }
 
-            let curr_page = curr_doc.get_dictionary(page_id)?;
-            let prev_page = prev_doc.deref_dict(page)?;
-
             extra_annotation = Some(Annotation {
                 page_idx,
-                // We need to check the page contents for the signature annotation.
-                rect: verify_page(curr_doc, page_id, curr_page, prev_page)?,
+                rect: rect_found,
             });
         }
     }
@@ -427,51 +433,19 @@ fn verify_pages(
     Ok(extra_annotation)
 }
 
-/// Returns the first different object id in the reference chain, if any.
-fn object_has_changed(
-    curr_doc: &Document,
-    prev_doc: &Document,
-    mut id: ObjectId,
-) -> Result<Option<ObjectId>> {
-    let mut seen = HashSet::from([id.0]);
-
-    while let (Some(curr_entry), Some(prev_entry)) = (
-        curr_doc.reference_table.entries.get(&id.0),
-        prev_doc.reference_table.entries.get(&id.0),
-    ) {
-        if XrefEntryComparer(curr_entry) != XrefEntryComparer(prev_entry) {
-            return Ok(Some(id));
-        }
-
-        if let Object::Reference(next_id) = curr_doc.get_object(id)? {
-            if seen.insert(next_id.0) {
-                id = *next_id;
-            } else {
-                // We have a cycle in the reference chain.
-                return Err(lopdf::Error::ReferenceLimit.into());
-            }
-        } else {
-            // The original object id points to the exact same object in the new document.
-            return Ok(None);
-        }
-    }
-
-    Err(lopdf::Error::ObjectNotFound.into())
-}
-
+/// The page can be identical, or it can have one extra annotation, in which
+/// case we return the rectangle where the annotation is located.
 fn verify_page(
     curr_doc: &Document,
     curr_page_id: ObjectId,
     curr_page: &Dictionary,
     prev_page: DictTracker,
-) -> Result<[f32; 4]> {
+) -> Result<Option<[f32; 4]>> {
     let mut prev_annots = None;
-    let mut extra_len = 1;
 
     for (key, obj) in prev_page.dict.iter() {
         if key == b"Annots" {
             prev_annots = Some(prev_page.tracker.deref(obj)?.as_array()?);
-            extra_len = 0;
 
             // Annotations are handled separately.
             continue;
@@ -483,14 +457,22 @@ fn verify_page(
         }
     }
 
+    let curr_annots = curr_page.get_deref(b"Annots", curr_doc);
+    let (extra_len, curr_annots) = match (prev_annots, curr_annots) {
+        (None, Ok(curr_annots)) => (1, curr_annots),
+        (Some(_), Ok(curr_annots)) => (0, curr_annots),
+        (None, Err(lopdf::Error::DictKey)) => return Ok(None),
+        (_, Err(err)) => return Err(err.into()),
+    };
+
     if curr_page.len() != prev_page.dict.len() + extra_len {
         return Err(Error::PageMismatch.into());
     }
 
-    let curr_annots = curr_page.get_deref(b"Annots", curr_doc)?.as_array()?;
-    let extra_annotation = has_array_one_extra_ref(curr_annots, prev_annots)?;
-
-    verify_annotation(curr_doc, curr_page_id, extra_annotation)
+    let curr_annots = curr_annots.as_array()?;
+    has_array_zero_or_one_extra_ref(curr_annots, prev_annots)?
+        .map(|extra_annotation| verify_annotation(curr_doc, curr_page_id, extra_annotation))
+        .transpose()
 }
 
 /// Some signing software creates an annotation /Widget with the "visuals" of
