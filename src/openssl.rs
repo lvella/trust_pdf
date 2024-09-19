@@ -152,6 +152,16 @@ mod tests {
     }
 
     #[test]
+    fn test_poppler_signature() {
+        let verifier = create_signature_verifier();
+        let pdfs_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("test_data/poppler");
+        let unsigned = fs::read(pdfs_dir.join("unsigned.pdf")).unwrap();
+
+        let result = verify(&verifier, &unsigned, pdfs_dir.join("signed.pdf"));
+        assert_eq!(result.len(), 9);
+    }
+
+    #[test]
     fn test_invalid_pdfs() {
         let verifier = create_signature_verifier();
         let pdfs_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("test_data/invalid_modification");
