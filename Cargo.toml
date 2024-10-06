@@ -1,6 +1,6 @@
 [package]
 name = "trust_pdf"
-version = "2.0.3"
+version = "2.0.4"
 edition = "2021"
 authors = ["Lucas Clemente Vella <lvella@gmail.com>"]
 description = "Verifies signed PDFs against the originals, checking for sneaky modifications."
@@ -12,11 +12,14 @@ readme = "README.md"
 anyhow = "1.0"
 array-init = "2.1"
 lazy_static = "1.5"
-lopdf = "0.33"
+lopdf = { version = "0.34", default-features = false, features = [
+	"nom_parser",
+] }
 openssl = { version = "0.10", optional = true }
 regex = "1.10"
 thiserror = "1.0"
 
 [features]
-default = ["openssl"]
+default = ["openssl", "rayon"]
 openssl = ["dep:openssl"]
+rayon = ["lopdf/rayon"]
