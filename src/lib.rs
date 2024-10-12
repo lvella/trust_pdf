@@ -98,15 +98,18 @@ impl<'a> Verifier<'a> {
     /// PDF document inside the full signed document, to be compared against.
     /// The contents of the original document must match the contents of the
     /// signed document.
+    ///
+    /// Returns all the signatures found, including the ones in the reference
+    /// document. The signatures are sorted from the most encompassing to the
+    /// least encompassing.
+    ///
+    /// ***No signature is verified by this method!*** You may use the optional
+    /// [`openssl`] module to verify them.
     pub fn verify(&self, end_of_reference_pdf: usize) -> Result<Vec<SignatureInfo>> {
         let doc = &self.doc;
         let pdf_bytes = self.pdf_bytes;
 
         basic_file_buff_checks(pdf_bytes, end_of_reference_pdf)?;
-
-        if end_of_reference_pdf == pdf_bytes.len() {
-            return Ok(Vec::new());
-        }
 
         // Access the AcroForm dictionary
         let acro_form = match doc.get_dict_in_dict(doc.catalog()?, b"AcroForm") {
