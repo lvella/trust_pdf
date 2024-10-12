@@ -140,31 +140,35 @@ impl<'a> Verifier<'a> {
         // next step.
         let partition_point =
             signatures.partition_point(|s| s.coverage_end as usize > end_of_reference_pdf);
-        let added_signatures = &signatures[..partition_point];
 
-        // An iterator in decreasing order over the incremental updates we are comparing against.
-        let incremental_updates = added_signatures[1..]
-            .iter()
-            .map(|s| s.coverage_end as usize)
-            .chain([end_of_reference_pdf]);
-
-        // Ensures that the incremental updates were added correctly.
         let mut annotations = Vec::new();
-        {
-            let mut tmp_storage;
-            let mut curr_doc = doc;
-            for (sig, previous_doc) in added_signatures.iter().zip(incremental_updates) {
-                // Signature offset must be after the previous document.
-                if (sig.offset as usize) < previous_doc {
-                    return Err(Error::InvalidSignatureObject.into());
+        if partition_point > 0 {
+            let added_signatures = &signatures[..partition_point];
+
+            // An iterator in decreasing order over the incremental updates we are comparing against.
+            let incremental_updates = added_signatures[1..]
+                .iter()
+                .map(|s| s.coverage_end as usize)
+                .chain([end_of_reference_pdf]);
+
+            // Ensures that the incremental updates were added correctly.
+            {
+                let mut tmp_storage;
+                let mut curr_doc = doc;
+                for (sig, previous_doc) in added_signatures.iter().zip(incremental_updates) {
+                    // Signature offset must be after the previous document.
+                    if (sig.offset as usize) < previous_doc {
+                        return Err(Error::InvalidSignatureObject.into());
+                    }
+
+                    let previous_doc = Document::load_mem(&pdf_bytes[..previous_doc])?;
+                    let annot =
+                        increment_validation::verify_increment(sig, curr_doc, &previous_doc)?;
+                    annotations.push(annot);
+
+                    tmp_storage = previous_doc;
+                    curr_doc = &tmp_storage;
                 }
-
-                let previous_doc = Document::load_mem(&pdf_bytes[..previous_doc])?;
-                let annot = increment_validation::verify_increment(sig, curr_doc, &previous_doc)?;
-                annotations.push(annot);
-
-                tmp_storage = previous_doc;
-                curr_doc = &tmp_storage;
             }
         }
 
@@ -370,4 +374,24 @@ lazy_static::lazy_static! {
 /// Tests if the PDF ends with the %%EOF marker.
 fn pdf_ends_with_eof(pdf_bytes: &[u8]) -> bool {
     EOF_REGEX.is_match(pdf_bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, path::Path};
+
+    use crate::Verifier;
+
+    #[test]
+    fn reference_is_the_full_document() {
+        let doc = fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("test_data/valid_modification/signed-visible.pdf"),
+        )
+        .unwrap();
+
+        let result = Verifier::parse(&doc).unwrap().verify(doc.len()).unwrap();
+
+        assert_eq!(result.len(), 1);
+    }
 }
