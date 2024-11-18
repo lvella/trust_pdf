@@ -82,7 +82,7 @@ signatures in the document:
 * In `/AcroForm`, a single extra `/FT /Sig` form field must be added;
 * In at most one of the pages, a single annotation of `/Subtype /Widget` can be
   added;
-* The signatures must be valid, and cover from the beginning of the document to
+* The signatures must cover from the beginning of the document to
   the end of their incremental update;
 * The final signature must cover the entire document;
 * And probably some more restrictions.
@@ -93,6 +93,12 @@ crafted and placed somewhere to meaningfully change the interpretation of the
 contents. To mitigate that, this library will also return the page and the
 rectangle of each signature annotation, for further whitelisting by the
 application.
+
+## Optional Features
+
+* `openssl`: this feature uses the `openssl` crate to provide a verifier for
+  PKCS #7 signatures embedded in the PDF files. This feature is optional, and
+  you may alternativelly use your own means of verifying PKCS #7 signatures.
 
 ## Usage
 
@@ -140,19 +146,19 @@ let Ok(signatures) = result else {
 }
 ```
 
-## Optional Features
+## Support
 
-* `openssl`: this feature uses the `openssl` crate to provide an implementation
-  for the `Pkcs7Verifier` trait, needed to verify PKCS #7 signatures embedded in
-  the PDF files. You can however provide your own implementation, so dependency
-  on OpenSSL is optional.
+I have tested it with PDFs produced by the following signing tools:
+
+* `pdfsign` command line utility (from Poppler);
+* gov.br online signer (from Brazilian government).
 
 ## Security
 
-This library is a best effort attempt, and as it stands, was written by one guy
-during his holidays and spare time, and underwent no independent review, no real
-world usage, and barely any testing. Also be mindful of the no-warranty clause
-in the license.
+This library is a best effort attempt. As it stands, it was written by one guy
+during his holidays and spare time, underwent no independent review, saw no
+real world usage, and had barely any testing. Also be mindful of the no-warranty
+clause in the license.
 
 That said, if you really want to secure anything with it, then I suggest, as a
 backup plan, putting legal language in you unsigned document saying that any
